@@ -1,0 +1,65 @@
+---
+# ============================================================================
+# Variables globales del clúster Slurm — group_vars/all.yml
+# ----------------------------------------------------------------------------
+# CERO hardcoding: el playbook no contiene secretos ni nombres embebidos.
+# Todo se consume desde aquí con fallbacks seguros.
+#
+# SECRETOS ⚠️  No guardes la contraseña en claro en el repositorio.
+# Usa Ansible Vault:
+#   ansible-vault encrypt_string 'Tu-Super-Clave-123' --name slurm_db_password
+#   ansible-playbook --ask-vault-pass playbook.yml
+# ============================================================================
+
+# ----- Identidad del clúster -----
+slurm_cluster_name: clusterUTN          # SlurmClusterName (DBD + slurm.conf + sacctmgr)
+slurm_version: "24.11.7"                # Versión de los paquetes .deb desplegados
+
+# ----- Usuario / grupo del servicio -----
+slurm_user: slurm
+slurm_group: slurm
+slurm_uid: 1100
+slurm_gid: 1100
+
+# ----- Base de datos contable (MySQL / SlurmDBD) -----
+# Host/IP derivados automáticamente del primer miembro del grupo [database].
+slurm_db_host: "{{ hostvars[groups['database'][0]]['ansible_facts']['hostname'] | default(groups['database'][0]) }}"
+slurm_db_ip: "{{ hostvars[groups['database'][0]]['ansible_facts']['default_ipv4']['address'] | default(hostvars[groups['database'][0]]['ansible_host']) }}"
+slurm_db_user: slurm
+slurm_db_password: "!!!CAMBIAME_VIA_ANSIBLE_VAULT!!!"
+slurm_db_name: slurm_acct_db
+slurm_db_port: 3306
+slurmdbd_port: 6819                     # Puerto del demonio SlurmDBD
+
+# ----- Almacenamiento compartido (NFS) -----
+slurm_shared_dir: /shared
+
+# ----- Contenedores (Apptainer) -----
+apptainer_bind_mount: /shared           # Bind path automático en contenedores
+apptainer_launchpad_key: "0xF6B0F5193D4F3301EF491FF0AFE36534FC6218AE"
+
+# ----- Ajustes de instalación / APT -----
+apt_lock_wait_timeout: 300              # Espera activa sobre locks dpkg/apt (segundos)
+# Paquetes runtime dependencias del .deb de Slurm (SchedMD para Ubuntu/Debian)
+slurm_runtime_packages:
+  - chrony
+  - munge
+  - libmunge2
+  - libhwloc15
+  - libjwt2
+  - libyaml-0-2
+  - libpmix2t64
+  - liblz4-1
+  - libhdf5-310
+  - libhdf5-hl-310
+  - liblua5.3-0
+  - libmysqlclient24
+  - libfreeipmi17
+  - libipmimonitoring6
+  - libhttp-parser2.9
+  - librdkafka1
+
+# Patrón de recurso local de paquetes Slurm (sin versión hardcodeada)
+slurm_packages_dir: packages
+slurm_deb_patterns:
+  - "slurm-smd_*.deb"

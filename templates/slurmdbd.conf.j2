@@ -1,0 +1,24 @@
+# Autenticación y demonio
+AuthType=auth/munge
+DbdHost={{ slurm_db_host }}
+DbdAddr={{ slurm_db_ip }}
+DbdPort={{ slurmdbd_port }}
+SlurmUser={{ slurm_user }}
+DebugLevel=info
+LogFile=/var/log/slurm/slurmdbd.log
+PidFile=/run/slurm/slurmdbd.pid
+
+# Parámetros de almacenamiento MySQL
+StorageType=accounting_storage/mysql
+StorageHost={{ slurm_db_host }}
+StoragePort={{ slurm_db_port }}
+StoragePass={{ slurm_db_password }}
+StorageUser={{ slurm_db_user }}
+StorageLoc={{ slurm_db_name }}
+
+# Tiempos de purga y retención de eventos
+PurgeEventAfter=12months
+PurgeJobAfter=12months
+PurgeResvAfter=2months
+PurgeStepAfter=2months
+PurgeSuspendAfter=1month

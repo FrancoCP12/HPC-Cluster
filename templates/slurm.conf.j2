@@ -1,0 +1,55 @@
+# Identidad del clúster
+ClusterName={{ slurm_cluster_name }}
+{% set master_node = groups['master'][0] %}
+{% set master_host = hostvars[master_node]['ansible_facts']['hostname'] | default('master') %}
+{% set master_ip = hostvars[master_node]['ansible_host'] | default(hostvars[master_node]['ansible_facts']['default_ipv4']['address']) %}
+SlurmctldHost={{ master_host }}({{ master_ip }})
+
+# Autenticación y demonios
+AuthType=auth/munge
+SlurmUser={{ slurm_user }}
+SlurmdUser=root
+SlurmctldPort=6817
+SlurmdPort=6818
+StateSaveLocation=/var/spool/slurmctld
+SlurmdSpoolDir=/var/spool/slurmd
+SwitchType=switch/none
+MpiDefault=none
+
+# Procesos, Scheduling y Recursos Genéricos (GRES / GPU)
+SlurmctldPidFile=/run/slurm/slurmctld.pid
+SlurmdPidFile=/run/slurm/slurmd.pid
+ProctrackType=proctrack/cgroup
+TaskPlugin=task/cgroup
+GresTypes=gpu
+SelectType=select/cons_tres
+SelectTypeParameters=CR_Core_Memory
+ReturnToService=1
+
+# Logs
+SlurmctldLogFile=/var/log/slurm/slurmctld.log
+SlurmdLogFile=/var/log/slurm/slurmd.log
+
+# Accounting Storage
+
+AccountingStorageType=accounting_storage/slurmdbd
+AccountingStorageHost={{ slurm_db_host }}
+AccountingStoragePort={{ slurmdbd_port }}
+AccountingStorageUser={{ slurm_db_user }}
+JobAcctGatherType=jobacct_gather/cgroup
+JobAcctGatherFrequency=30
+
+# Definición Dinámica de Nodos de Cómputo (Ansible Facts + GRES)
+
+{% for node in groups['compute'] %}
+{% set node_host = hostvars[node]['ansible_facts']['hostname'] | default(node) %}
+{% set node_ip = hostvars[node]['ansible_host'] | default(hostvars[node]['ansible_facts']['default_ipv4']['address'] | default(node)) %}
+{% set cpus = hostvars[node]['ansible_facts']['processor_vcpus'] | default(1) %}
+{% set mem = ((hostvars[node]['ansible_facts']['memtotal_mb'] | default(1024)) * 0.9) | int %}
+{% set gpus = hostvars[node]['detected_gpus'] | default(0) | int %}
+NodeName={{ node_host }} NodeAddr={{ node_ip }} CPUs={{ cpus }} RealMemory={{ mem }}{% if gpus > 0 %} Gres=gpu:{{ gpus }}{% endif %} Feature={{ hostvars[node]['node_feature'] | default('standperf') }} State=UNKNOWN
+{% endfor %}
+
+# Definición de Partición
+
+PartitionName=general Nodes={% for node in groups['compute'] %}{{ hostvars[node]['ansible_facts']['hostname'] | default(node) }}{% if not loop.last %},{% endif %}{% endfor %} Default=YES MaxTime=INFINITE State=UP

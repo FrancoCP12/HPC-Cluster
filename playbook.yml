@@ -1,0 +1,757 @@
+---
+# ============================================================================
+# Playbook Ansible — Despliegue de clúster Slurm + GPUs (Debian/Ubuntu)
+#
+#   master   → slurmctld + servidor NFS + Apptainer
+#   database → MySQL + slurmdbd
+#   compute  → slurmd + GPUs + NFS client + Apptainer
+#
+# ============================================================================
+
+# --------------------------------------------------------------
+# Paso 0: Facts globales (necesarios para templates multi-nodo)
+# --------------------------------------------------------------
+- name: "Paso 0: Recolección de facts global"
+  hosts: slurm_cluster
+  gather_facts: true
+  tasks: []
+
+# --------------------------------------------------------------
+# 1. Infraestructura base, sincronización horaria y autenticación Munge
+# --------------------------------------------------------------
+- name: "1. Infraestructura base, sincronización horaria y autenticación Munge"
+  hosts: all
+  become: true
+  tasks:
+
+    - name: Detener y enmascarar timers/servicios de actualización desatendida
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: stopped
+        enabled: false
+        masked: true
+      loop:
+        - apt-daily.timer
+        - apt-daily-upgrade.timer
+        - unattended-upgrades
+      failed_when: false
+
+    - name: Esperar liberación de locks de apt/dpkg (timeout {{ apt_lock_wait_timeout }}s)
+      ansible.builtin.shell: |
+        END=$((SECONDS + {{ apt_lock_wait_timeout }}))
+        while fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock >/dev/null 2>&1; do
+          if [ "$SECONDS" -ge "$END" ]; then
+            echo "TIMEOUT: locks de apt/dpkg ocupados > {{ apt_lock_wait_timeout }}s" >&2
+            exit 124
+          fi
+          sleep 3
+        done
+      register: apt_lock_wait
+      changed_when: false
+      failed_when: apt_lock_wait.rc != 0
+
+
+    - name: Asegurar dependencias de gestión de repositorios
+      ansible.builtin.apt:
+        name: software-properties-common
+        state: present
+        update_cache: true
+
+    - name: Instalar Chrony, Munge y dependencias runtime de Slurm
+      ansible.builtin.apt:
+        name: "{{ slurm_runtime_packages }}"
+        state: present
+        update_cache: yes
+
+
+    - name: Detener y enmascarar systemd-timesyncd (evita conflicto de sockets)
+      ansible.builtin.systemd:
+        name: systemd-timesyncd
+        state: stopped
+        enabled: false
+        masked: true
+      failed_when: false
+
+    - name: Asegurar que Chrony esté activo y habilitado
+      ansible.builtin.service:
+        name: chrony
+        state: started
+        enabled: true
+
+
+    - name: Forzar sincronización horaria inicial con chronyc makestep
+      ansible.builtin.command:
+        cmd: chronyc makestep 1 -1
+      register: chrony_makestep
+      changed_when: false
+      failed_when: false
+
+    - name: Asegurar que el repositorio universe esté habilitado
+      ansible.builtin.command: add-apt-repository -y universe
+      changed_when: false
+
+
+    - name: Garantizar resolución local de hostnames en todos los nodos
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        line: "{{ hostvars[item]['ansible_host'] | default(hostvars[item]['ansible_facts']['default_ipv4']['address'] | default(item)) }} {{ hostvars[item]['ansible_facts']['hostname'] | default(item) }}"
+        state: present
+      loop: "{{ groups['all'] }}"
+
+
+    - name: Persistir /run/slurm mediante systemd-tmpfiles
+      ansible.builtin.copy:
+        dest: /etc/tmpfiles.d/slurm.conf
+        content: |
+          d /run/slurm 0755 slurm slurm -
+        mode: '0644'
+
+    - name: Aplicar tmpfiles de Slurm inmediatamente
+      ansible.builtin.command: systemd-tmpfiles --create /etc/tmpfiles.d/slurm.conf
+      changed_when: false
+
+    - name: Asegurar grupo slurm con GID unificado
+      ansible.builtin.group:
+        name: "{{ slurm_group }}"
+        gid: "{{ slurm_gid }}"
+        system: true
+        state: present
+
+    - name: Asegurar usuario slurm con UID unificado
+      ansible.builtin.user:
+        name: "{{ slurm_user }}"
+        uid: "{{ slurm_uid }}"
+        group: "{{ slurm_group }}"
+        system: true
+        shell: /bin/false
+        create_home: false
+        state: present
+
+    - name: Generar munge.key en el nodo maestro
+      ansible.builtin.command:
+        cmd: create-munge-key -f
+        creates: /etc/munge/munge.key
+      delegate_to: "{{ groups['master'][0] }}"
+      run_once: true
+
+    - name: Leer munge.key desde el maestro
+      ansible.builtin.slurp:
+        src: /etc/munge/munge.key
+      delegate_to: "{{ groups['master'][0] }}"
+      run_once: true
+      register: munge_key_master
+
+    - name: Distribuir munge.key con permisos estrictos a todos los nodos
+      ansible.builtin.copy:
+        content: "{{ munge_key_master['content'] | b64decode }}"
+        dest: /etc/munge/munge.key
+        owner: munge
+        group: munge
+        mode: '0400'
+
+    - name: Iniciar y habilitar servicio munge en todos los nodos
+      ansible.builtin.service:
+        name: munge
+        state: restarted
+        enabled: true
+
+
+    - name: Crear directorio temporal para paquetes deb
+      ansible.builtin.file:
+        path: /tmp/slurm_debs
+        state: directory
+        mode: '0755'
+
+    - name: Copiar paquetes base y clientes de Slurm
+      ansible.builtin.copy:
+        src: "{{ item }}"
+        dest: /tmp/slurm_debs/
+        mode: '0644'
+      with_fileglob:
+        - "{{ slurm_packages_dir }}/slurm-smd_*.deb"
+        - "{{ slurm_packages_dir }}/slurm-smd-client_*.deb"
+
+    - name: Localizar paquetes deb de Slurm en el nodo remoto
+      ansible.builtin.find:
+        paths: /tmp/slurm_debs
+        patterns:
+          - "slurm-smd_*.deb"
+          - "slurm-smd-client_*.deb"
+      register: slurm_base_debs
+
+
+    - name: Instalar paquetes base y clientes de Slurm juntos
+      ansible.builtin.shell:
+        cmd: DEBIAN_FRONTEND=noninteractive apt-get -y -o Dpkg::Options::="--force-confnew" install /tmp/slurm_debs/slurm-smd_*.deb /tmp/slurm_debs/slurm-smd-client_*.deb
+      register: apt_slurm_base
+      when: slurm_base_debs.files | length > 0
+      changed_when: "'Setting up' in apt_slurm_base.stdout"
+
+    - name: Reparar paquetes rotos si hubo una ejecución interrumpida previa
+      ansible.builtin.command: apt-get install -f -y
+      changed_when: false
+      failed_when: false
+
+# --------------------------------------------------------------
+# 2. Base de datos y demonio SlurmDBD
+# --------------------------------------------------------------
+- name: "2. Aprovisionar base de datos y demonio SlurmDBD"
+  hosts: database
+  become: true
+
+  handlers:
+    - name: Reiniciar MySQL
+      ansible.builtin.systemd:
+        name: mysql
+        state: restarted
+
+    - name: Reiniciar slurmdbd
+      ansible.builtin.systemd:
+        name: slurmdbd
+        state: restarted
+
+  tasks:
+
+    - name: Esperar liberación de locks de apt/dpkg (timeout {{ apt_lock_wait_timeout }}s)
+      ansible.builtin.shell: |
+        END=$((SECONDS + {{ apt_lock_wait_timeout }}))
+        while fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock >/dev/null 2>&1; do
+          if [ "$SECONDS" -ge "$END" ]; then
+            echo "TIMEOUT: locks de apt/dpkg ocupados > {{ apt_lock_wait_timeout }}s" >&2
+            exit 124
+          fi
+          sleep 3
+        done
+      register: apt_lock_wait_db
+      changed_when: false
+      failed_when: apt_lock_wait_db.rc != 0
+
+    - name: Instalar MySQL Server y conector Python
+      ansible.builtin.apt:
+        name:
+          - mysql-server
+          - mysql-client
+          - python3-pymysql
+          - libmysqlclient-dev
+        state: latest
+        update_cache: yes
+        force_apt_get: yes
+
+    - name: Asegurar que el servicio MySQL esté activo y habilitado
+      ansible.builtin.systemd:
+        name: mysql
+        state: started
+        enabled: true
+
+    - name: Permitir que MySQL escuche en todas las interfaces de red (0.0.0.0)
+      ansible.builtin.lineinfile:
+        path: /etc/mysql/mysql.conf.d/mysqld.cnf
+        regexp: '^\s*bind-address\s*=.*'
+        line: 'bind-address = 0.0.0.0'
+        insertafter: '^\[mysqld\]'
+      notify: Reiniciar MySQL
+
+    - name: Forzar flush de handlers para aplicar bind-address de MySQL inmediatamente
+      ansible.builtin.meta: flush_handlers
+
+    - name: Crear base de datos contable de Slurm
+      ansible.builtin.command:
+        cmd: >
+          mysql -u root --socket=/var/run/mysqld/mysqld.sock -e
+          "CREATE DATABASE IF NOT EXISTS {{ slurm_db_name }};"
+      changed_when: false
+
+    
+    - name: Crear usuario Slurm y otorgar privilegios en MySQL
+      ansible.builtin.command:
+        cmd: >
+          mysql -u root --socket=/var/run/mysqld/mysqld.sock -e
+          "CREATE USER IF NOT EXISTS '{{ slurm_db_user }}'@'%' IDENTIFIED WITH caching_sha2_password BY '{{ slurm_db_password }}';
+           ALTER USER '{{ slurm_db_user }}'@'%' IDENTIFIED WITH caching_sha2_password BY '{{ slurm_db_password }}';
+           GRANT ALL PRIVILEGES ON {{ slurm_db_name }}.* TO '{{ slurm_db_user }}'@'%';
+           CREATE USER IF NOT EXISTS '{{ slurm_db_user }}'@'localhost' IDENTIFIED WITH caching_sha2_password BY '{{ slurm_db_password }}';
+           ALTER USER '{{ slurm_db_user }}'@'localhost' IDENTIFIED WITH caching_sha2_password BY '{{ slurm_db_password }}';
+           GRANT ALL PRIVILEGES ON {{ slurm_db_name }}.* TO '{{ slurm_db_user }}'@'localhost';
+           FLUSH PRIVILEGES;"
+      no_log: true
+      changed_when: false
+
+    # [REQ 5] Sin versiones hardcodeadas: comodines en patrón base + slurmdbd
+    - name: Crear directorio temporal para paquetes Slurm
+      ansible.builtin.file:
+        path: /tmp/slurm_debs
+        state: directory
+        mode: '0755'
+
+    - name: Copiar paquetes base y slurmdbd al nodo remoto
+      ansible.builtin.copy:
+        src: "{{ item }}"
+        dest: /tmp/slurm_debs/
+        mode: '0644'
+      with_fileglob:
+        - "{{ slurm_packages_dir }}/slurm-smd_*.deb"
+        - "{{ slurm_packages_dir }}/slurm-smd-slurmdbd_*.deb"
+
+    - name: Localizar paquetes deb de slurmdbd en nodo remoto
+      ansible.builtin.find:
+        paths: /tmp/slurm_debs
+        patterns:
+          - "slurm-smd_*.deb"
+          - "slurm-smd-slurmdbd_*.deb"
+      register: slurm_dbd_debs
+
+    - name: Instalar paquetes base y slurmdbd juntos
+      ansible.builtin.shell:
+        cmd: DEBIAN_FRONTEND=noninteractive apt-get -y -o Dpkg::Options::="--force-confnew" install /tmp/slurm_debs/slurm-smd_*.deb /tmp/slurm_debs/slurm-smd-slurmdbd_*.deb
+      register: apt_slurm_dbd
+      when: slurm_dbd_debs.files | length > 0
+      changed_when: "'Setting up' in apt_slurm_dbd.stdout"
+
+    - name: Actualizar cache de librerías dinámicas
+      ansible.builtin.command: ldconfig
+      changed_when: false
+
+    - name: Asegurar directorios de log, runtime y configuración para slurmdbd
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ slurm_user }}"
+        group: "{{ slurm_group }}"
+        mode: '0755'
+      loop:
+        - /etc/slurm
+        - /var/log/slurm
+        - /run/slurm
+
+
+    - name: Desplegar slurmdbd.conf con permisos estrictos
+      ansible.builtin.template:
+        src: templates/slurmdbd.conf.j2
+        dest: /etc/slurm/slurmdbd.conf
+        owner: "{{ slurm_user }}"
+        group: "{{ slurm_group }}"
+        mode: '0600'
+      no_log: true
+      notify: Reiniciar slurmdbd
+
+    - name: Recargar systemd tras instalar nuevas unidades
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Forzar flush para aplicar configuración antes del arranque
+      ansible.builtin.meta: flush_handlers
+
+    - name: Asegurar que el servicio slurmdbd esté activo y habilitado
+      ansible.builtin.systemd:
+        name: slurmdbd
+        state: started
+        enabled: true
+
+# --------------------------------------------------------------
+# 3. Controlador maestro Slurm (slurmctld)
+# --------------------------------------------------------------
+- name: "3. Aprovisionar controlador maestro Slurm (slurmctld)"
+  hosts: master
+  become: true
+  tasks:
+
+    - name: Copiar paquete slurmctld al master
+      ansible.builtin.copy:
+        src: "{{ item }}"
+        dest: /tmp/slurm_debs/
+        mode: '0644'
+      with_fileglob:
+        - "{{ slurm_packages_dir }}/slurm-smd-slurmctld_*.deb"
+
+    - name: Localizar paquetes deb de slurmctld en el master
+      ansible.builtin.find:
+        paths: /tmp/slurm_debs
+        patterns:
+          - "slurm-smd-slurmctld_*.deb"
+      register: slurm_ctld_debs
+
+    - name: Instalar paquete slurmctld
+      ansible.builtin.shell:
+        cmd: DEBIAN_FRONTEND=noninteractive apt-get -y -o Dpkg::Options::="--force-confnew" install /tmp/slurm_debs/slurm-smd-slurmctld_*.deb
+      register: apt_slurmctld
+      when: slurm_ctld_debs.files | length > 0
+      changed_when: "'Setting up' in apt_slurmctld.stdout"
+
+    - name: Crear directorios de runtime, log y spool para slurmctld
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ slurm_user }}"
+        group: "{{ slurm_group }}"
+        mode: '0755'
+      loop:
+        - /etc/slurm
+        - /var/log/slurm
+        - /run/slurm
+        - /var/spool/slurmctld
+
+
+    - name: Esperar a que slurmdbd esté activo en el puerto {{ slurmdbd_port }}
+      ansible.builtin.wait_for:
+        host: "{{ slurm_db_host }}"
+        port: "{{ slurmdbd_port }}"
+        state: started
+        delay: 5
+        timeout: 120
+
+    - name: Desplegar slurm.conf
+      ansible.builtin.template:
+        src: templates/slurm.conf.j2
+        dest: /etc/slurm/slurm.conf
+        owner: "{{ slurm_user }}"
+        group: "{{ slurm_group }}"
+        mode: '0644'
+
+
+    - name: Comprobar si el clúster ya está registrado en SlurmDBD
+      ansible.builtin.command:
+        cmd: sacctmgr --noheader --parsable2 show cluster {{ slurm_cluster_name }}
+      register: sacctmgr_show_cluster
+      changed_when: false
+      failed_when: false
+
+
+    - name: Registrar el clúster en SlurmDBD si aún no existe
+      ansible.builtin.command:
+        cmd: sacctmgr -i add cluster {{ slurm_cluster_name }}
+      register: sacctmgr_add_cluster
+      when: slurm_cluster_name not in (sacctmgr_show_cluster.stdout | default(''))
+      failed_when: >-
+        sacctmgr_add_cluster.rc != 0
+        and 'already exists' not in
+        (((sacctmgr_add_cluster.stdout | default('')) ~ (sacctmgr_add_cluster.stderr | default(''))) | lower)
+      changed_when: >-
+        'already exists' not in
+        (((sacctmgr_add_cluster.stdout | default('')) ~ (sacctmgr_add_cluster.stderr | default(''))) | lower)
+
+    - name: Recargar systemd y arrancar slurmctld
+      ansible.builtin.systemd:
+        name: slurmctld
+        state: restarted
+        enabled: true
+        daemon_reload: true
+
+# --------------------------------------------------------------
+# NFS: Almacenamiento común para scripts y datasets
+# --------------------------------------------------------------
+- name: "Configurar Servidor NFS en el nodo Master"
+  hosts: master
+  become: true
+  tasks:
+    - name: Instalar paquetes del servidor NFS
+      ansible.builtin.apt:
+        name: nfs-kernel-server
+        state: present
+
+    # [REQ 10] Sticky bit 1777: un usuario no puede sobreescribir archivos ajenos
+    - name: Crear directorio compartido para trabajos de Slurm
+      ansible.builtin.file:
+        path: "{{ slurm_shared_dir }}"
+        state: directory
+        owner: "{{ slurm_user }}"
+        group: "{{ slurm_group }}"
+        mode: '1777'
+
+    - name: Configurar exportación en /etc/exports
+      ansible.builtin.lineinfile:
+        path: /etc/exports
+        line: "{{ slurm_shared_dir }} *(rw,sync,no_subtree_check,no_root_squash)"
+        state: present
+      notify: Reiniciar servidor NFS
+
+  handlers:
+    - name: Reiniciar servidor NFS
+      ansible.builtin.service:
+        name: nfs-kernel-server
+        state: restarted
+
+- name: "Montar recurso NFS en los nodos de Cómputo"
+  hosts: compute
+  become: true
+  tasks:
+    - name: Instalar cliente NFS
+      ansible.builtin.apt:
+        name: nfs-common
+        state: present
+
+
+    - name: Crear punto de montaje compartido
+      ansible.builtin.file:
+        path: "{{ slurm_shared_dir }}"
+        state: directory
+        mode: '1777'
+
+
+    - name: Montar y persistir recurso compartido en fstab (con _netdev)
+      ansible.posix.mount:
+        src: "{{ hostvars[groups['master'][0]]['ansible_host'] | default(groups['master'][0]) }}:{{ slurm_shared_dir }}"
+        path: "{{ slurm_shared_dir }}"
+        fstype: nfs
+        opts: rw,sync,hard,intr,_netdev
+        state: mounted
+
+# --------------------------------------------------------------
+# 4. Nodos de cómputo (slurmd) y detección GRES
+# --------------------------------------------------------------
+- name: "4. Aprovisionar nodos de cómputo (slurmd)"
+  hosts: compute
+  become: true
+  tasks:
+
+    - name: Detectar aceleradoras GPU y vendor en el nodo worker
+      ansible.builtin.shell: |
+        VENDOR=none
+        COUNT=0
+        # 1) Herramientas oficiales del vendor
+        if command -v nvidia-smi >/dev/null 2>&1; then
+          N=$(nvidia-smi --query-gpu=count --format=csv,noheader 2>/dev/null | head -n 1 | tr -d '[:space:]')
+          if [ "${N:-0}" -gt 0 ] 2>/dev/null; then COUNT=$N; VENDOR=nvidia; fi
+        fi
+        if [ "$VENDOR" = "none" ] && command -v rocm-smi >/dev/null 2>&1; then
+          N=$(rocm-smi --showid 2>/dev/null | grep -c '^GPU' || true)
+          if [ "${N:-0}" -gt 0 ] 2>/dev/null; then COUNT=$N; VENDOR=amd; fi
+        fi
+        # 2) Nodos de dispositivo del kernel
+        if [ "$VENDOR" = "none" ] && ls /dev/nvidia[0-9]* >/dev/null 2>&1; then
+          N=$(ls /dev/nvidia[0-9]* 2>/dev/null | grep -c 'nvidia[0-9]' || true)
+          if [ "${N:-0}" -gt 0 ] 2>/dev/null; then COUNT=$N; VENDOR=nvidia; fi
+        fi
+        if [ "$VENDOR" = "none" ] && [ -e /dev/kfd ]; then
+          N=$(ls /dev/dri/renderD[0-9]* 2>/dev/null | wc -l)
+          if [ "${N:-0}" -gt 0 ] 2>/dev/null; then COUNT=$N; VENDOR=amd; fi
+        fi
+        # 3) Clasificación por hardware con lspci (IDs PCI: 10de=NVIDIA, 1002=AMD)
+        if [ "$VENDOR" = "none" ] && command -v lspci >/dev/null 2>&1; then
+          if lspci -nn 2>/dev/null | grep -Ei '\[10de:' | grep -qiE 'VGA|3D controller|Display'; then
+            N=$(lspci -nn 2>/dev/null | grep -Ei '\[10de:' | grep -ciE 'VGA|3D controller|Display' || true)
+            if [ "${N:-0}" -gt 0 ] 2>/dev/null; then COUNT=$N; VENDOR=nvidia; fi
+          elif lspci -nn 2>/dev/null | grep -Ei '\[1002:' | grep -qiE 'VGA|3D controller|Display'; then
+            N=$(lspci -nn 2>/dev/null | grep -Ei '\[1002:' | grep -ciE 'VGA|3D controller|Display' || true)
+            if [ "${N:-0}" -gt 0 ] 2>/dev/null; then
+              R=$(ls /dev/dri/renderD[0-9]* 2>/dev/null | wc -l)
+              COUNT=$N
+              [ "${R:-0}" -gt 0 ] 2>/dev/null && COUNT=$R
+              VENDOR=amd
+            fi
+          fi
+        fi
+        echo "vendor=${VENDOR} count=${COUNT}"
+      register: gpu_detection
+      changed_when: false
+
+    - name: Registrar facts de GPU en la memoria de Ansible
+      ansible.builtin.set_fact:
+        detected_gpus: "{{ (gpu_detection.stdout | regex_search('count=([0-9]+)') | default('count=0') | replace('count=', '')) | int }}"
+        gpu_vendor: "{{ gpu_detection.stdout | regex_search('vendor=([a-z]+)') | default('vendor=none') | replace('vendor=', '') }}"
+
+
+    - name: Crear directorio temporal para paquetes deb
+      ansible.builtin.file:
+        path: /tmp/slurm_debs
+        state: directory
+        mode: '0755'
+
+    - name: Copiar paquete slurmd al nodo worker
+      ansible.builtin.copy:
+        src: "{{ item }}"
+        dest: /tmp/slurm_debs/
+        mode: '0644'
+      with_fileglob:
+        - "{{ slurm_packages_dir }}/slurm-smd-slurmd_*.deb"
+
+    - name: Localizar paquetes deb de slurmd en el worker
+      ansible.builtin.find:
+        paths: /tmp/slurm_debs
+        patterns:
+          - "slurm-smd-slurmd_*.deb"
+      register: slurm_slurmd_debs
+
+    - name: Instalar paquete slurmd
+      ansible.builtin.shell:
+        cmd: DEBIAN_FRONTEND=noninteractive apt-get -y -o Dpkg::Options::="--force-confnew" install /tmp/slurm_debs/slurm-smd-slurmd_*.deb
+      register: apt_slurmd
+      when: slurm_slurmd_debs.files | length > 0
+      changed_when: "'Setting up' in apt_slurmd.stdout"
+
+    - name: Crear directorios de ejecución, spool y logs de Slurm
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ slurm_user }}"
+        group: "{{ slurm_group }}"
+        mode: '0755'
+      loop:
+        - /etc/slurm
+        - /var/log/slurm
+        - /run/slurm
+        - /var/spool/slurmd
+
+    - name: Desplegar configuración cgroup.conf
+      ansible.builtin.copy:
+        dest: /etc/slurm/cgroup.conf
+        content: |
+          CgroupPlugin=cgroup/v2
+          ConstrainCores=yes
+          ConstrainRAMSpace=yes
+        owner: "{{ slurm_user }}"
+        group: "{{ slurm_group }}"
+        mode: '0644'
+      notify: Reiniciar slurmd
+
+    - name: Desplegar gres.conf si se detectaron GPUs
+      ansible.builtin.template:
+        src: templates/gres.conf.j2
+        dest: /etc/slurm/gres.conf
+        owner: "{{ slurm_user }}"
+        group: "{{ slurm_group }}"
+        mode: '0644'
+      when: detected_gpus | int > 0
+      notify: Reiniciar slurmd
+
+    - name: Asegurar ausencia de gres.conf si el nodo es solo CPU
+      ansible.builtin.file:
+        path: /etc/slurm/gres.conf
+        state: absent
+      when: detected_gpus | int == 0
+      notify: Reiniciar slurmd
+
+    - name: Desplegar slurm.conf unificado en el nodo worker (con Gres incluido)
+      ansible.builtin.template:
+        src: templates/slurm.conf.j2
+        dest: /etc/slurm/slurm.conf
+        owner: "{{ slurm_user }}"
+        group: "{{ slurm_group }}"
+        mode: '0644'
+      notify: Reiniciar slurmd
+
+    - name: Forzar flush handlers para que slurmd inicie con la configuración lista
+      ansible.builtin.meta: flush_handlers
+
+    - name: Iniciar y habilitar slurmd
+      ansible.builtin.systemd:
+        name: slurmd
+        state: started
+        enabled: true
+        daemon_reload: true
+
+  handlers:
+    - name: Reiniciar slurmd
+      ansible.builtin.service:
+        name: slurmd
+        state: restarted
+
+# --------------------------------------------------------------
+# Apptainer en Master y Nodos de Cómputo
+# --------------------------------------------------------------
+- name: "Instalar Apptainer en Master y Nodos de Cómputo"
+  hosts: master,compute
+  become: true
+  tasks:
+    - name: Esperar liberación de locks de apt/dpkg (timeout {{ apt_lock_wait_timeout }}s)
+      ansible.builtin.shell: |
+        END=$((SECONDS + {{ apt_lock_wait_timeout }}))
+        while fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock >/dev/null 2>&1; do
+          if [ "$SECONDS" -ge "$END" ]; then
+            echo "TIMEOUT: locks de apt/dpkg ocupados > {{ apt_lock_wait_timeout }}s" >&2
+            exit 124
+          fi
+          sleep 3
+        done
+      register: apt_lock_wait_appa
+      changed_when: false
+      failed_when: apt_lock_wait_appa.rc != 0
+
+    - name: Asegurar dependencias previas de sistema para repositorios
+      ansible.builtin.apt:
+        name:
+          - software-properties-common
+          - apt-transport-https
+          - ca-certificates
+          - curl
+        state: present
+        update_cache: true
+
+    - name: Asegurar directorio para llaveros apt
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Descargar llave GPG oficial del PPA de Apptainer por HTTPS
+      ansible.builtin.get_url:
+        url: "https://keyserver.ubuntu.com/pks/lookup?op=get&search={{ apptainer_launchpad_key }}"
+        dest: /etc/apt/keyrings/apptainer.asc
+        mode: '0644'
+
+    - name: Agregar repositorio de Apptainer con el keyring local
+      ansible.builtin.apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/apptainer.asc] https://ppa.launchpadcontent.net/apptainer/ppa/ubuntu {{ ansible_distribution_release }} main"
+        state: present
+        filename: apptainer-ppa
+        update_cache: true
+
+    - name: Instalar Apptainer y paquete suid complementario
+      ansible.builtin.apt:
+        name:
+          - apptainer
+          - apptainer-suid
+        state: present
+
+    - name: Asegurar que el recurso compartido se monte en todos los contenedores
+      ansible.builtin.lineinfile:
+        path: /etc/apptainer/apptainer.conf
+        regexp: '^bind path = {{ apptainer_bind_mount }}'
+        line: 'bind path = {{ apptainer_bind_mount }}'
+        state: present
+
+    - name: Validar instalación de Apptainer comprobando su versión
+      ansible.builtin.command: apptainer --version
+      register: apptainer_ver
+      changed_when: false
+
+    - name: Mostrar versión instalada
+      ansible.builtin.debug:
+        msg: "Apptainer instalado con éxito en {{ inventory_hostname }}: {{ apptainer_ver.stdout }}"
+
+# --------------------------------------------------------------
+# 5. Sincronización de topología en Master y limpieza de DRAIN
+# --------------------------------------------------------------
+- name: "5. Sincronizar topología descubierta en Master y limpiar DRAIN"
+  hosts: master
+  become: true
+  tasks:
+
+    - name: Esperar a que slurmdbd esté activo en el puerto {{ slurmdbd_port }}
+      ansible.builtin.wait_for:
+        host: "{{ slurm_db_host }}"
+        port: "{{ slurmdbd_port }}"
+        state: started
+        delay: 3
+        timeout: 60
+
+    - name: Actualizar slurm.conf en el master con las GPUs de todos los workers
+      ansible.builtin.template:
+        src: templates/slurm.conf.j2
+        dest: /etc/slurm/slurm.conf
+        owner: "{{ slurm_user }}"
+        group: "{{ slurm_group }}"
+        mode: '0644'
+
+    - name: Aplicar reconfiguración en caliente en slurmctld
+      ansible.builtin.command: scontrol reconfigure
+      changed_when: true
+
+    - name: Esperar 3 segundos para que los daemons sincronicen heartbeats
+      ansible.builtin.pause:
+        seconds: 3
+
+    - name: Reanudar nodos limpiando estados DRAIN previos
+      ansible.builtin.shell: 'scontrol update nodename={{ hostvars[item]["ansible_facts"]["hostname"] | default(item) }} state=RESUME reason=""'
+      loop: "{{ groups['compute'] }}"
+      changed_when: false
+      failed_when: false

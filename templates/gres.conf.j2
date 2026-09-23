@@ -1,0 +1,23 @@
+{# Configuración GRES generada por Ansible — No editar manualmente #}
+{# vendor={{ gpu_vendor | default('none') }} | gpus={{ detected_gpus | default(0) | int }} #}
+{%- if gpu_vendor == 'nvidia' %}
+
+# --- NVIDIA ---
+# AutoDetect por NVML (usa nvidia-smi para mapear los GPUs)
+AutoDetect=nvml
+
+# Fallback manual si NVML no estuviera disponible: mapeo explícito a /dev/nvidia*,
+# como comentario nativo de Jinja para que la expresión NO se renderice
+# (evita 'unsupported operand type(s) for -: AnsibleUnsafeText and int').
+{# NodeName={{ ansible_facts['hostname'] }} Name=gpu File=/dev/nvidia[0-{{ (detected_gpus | int) - 1 }}] Type=nvidia #}
+
+{%- elif gpu_vendor == 'amd' %}
+
+# --- AMD / ROCm ---
+# Flujo principal: un GRES por GPU, /dev/kfd + un /dev/dri/renderD por device
+NodeName={{ ansible_facts['hostname'] }} Name=gpu File=/dev/kfd Type=amd
+{%- for i in range(detected_gpus | int) %}
+NodeName={{ ansible_facts['hostname'] }} Name=gpu File=/dev/dri/renderD{{ 128 + i }} Type=amd
+{%- endfor %}
+
+{%- endif %}
