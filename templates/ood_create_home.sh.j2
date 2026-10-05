@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# Creador del home compartido para Open OnDemand.
+#
+# CONTRATO DE INVOCACION (importante):
+# nginx_stage lo llama desde exec_pre_hook en pun_config_generator.rb:
+#     args = ["--user", user.to_s]
+#     Open3.capture3(pre_hook_root_cmd, *args)
+#
+# Ruby's spawn, cuando hay argumentos adicionales, trata el string de comando
+# como una RUTA LITERAL de ejecutable: no pasa por shell ni hace split. Por eso
+# pun_pre_hook_root_cmd debe ser una ruta sin argumentos y sin espacios, y este
+# script tiene que recibir el login en el par --user <login>.
+#
+# uid/gid NO se hardcodean: salen de getent passwd, que es la unica fuente
+# correcta cuando hay varios usuarios en el arbol LDAP.
+set -euo pipefail
+
+SHARED_HOME_ROOT="{{ shared_home_root }}"
+SHARED_HOME_GROUP="{{ home_group }}"
+ROOT_MODE="{{ home_root_mode }}"
+USER_MODE="{{ home_user_mode }}"
+SKEL_DIR="{{ home_skel_dir }}"
+
+die() { echo "ood_create_home: $*" >&2; exit 1; }
+
+# --- 1. Argumentos -----------------------------------------------------------
+[ "$#" -ge 2 ] || die "uso: $(basename "$0") --user <login>"
+case "$1" in
+  --user) USER_NAME="$2" ;;
+  *) die "argumento inesperado: $1" ;;
+esac
+
+# --- 2. Validacion del login (esto corre como root: evita path traversal) ----
+case "$USER_NAME" in
+  [a-z_][a-z0-9_-]*) ;;
+  *) die "login invalido: $USER_NAME" ;;
+esac
+
+# --- 3. Fuente de verdad: el directorio de usuarios, no el playbook ----------
+PASSWD_ENTRY="$(getent passwd "$USER_NAME" || true)"
+[ -n "$PASSWD_ENTRY" ] || die "usuario inexistente: $USER_NAME"
+# login:password:uid:gid:gecos:home:shell  (7 campos; el GECOS suele traer
+# espacios y comas, ej. "Alumno Uno", hay que descartarlo explicitamente)
+IFS=: read -r _name _pw UID_NUM GID_NUM _gecos HOME_DIR _shell <<<"$PASSWD_ENTRY"
+[ -n "${HOME_DIR:-}" ] || die "home vacio para $USER_NAME"
+case "$HOME_DIR" in
+  /*) ;;
+  *) die "home no absoluto para $USER_NAME: $HOME_DIR" ;;
+esac
+
+# El home debe caer dentro de la raiz compartida configurada en el playbook.
+case "$HOME_DIR" in
+  "${SHARED_HOME_ROOT}"/*) ;;
+  *) die "home fuera de ${SHARED_HOME_ROOT}: $HOME_DIR" ;;
+esac
+
+# --- 4. Padre setgid ---------------------------------------------------------
+# Los homes heredan el grupo y siguen siendo escribibles por el grupo aunque se
+# creen como root. Sin esto el home queda 755 y no lo puede escribir nadie mas.
+install -d -m "$ROOT_MODE" -o root -g "$SHARED_HOME_GROUP" "$SHARED_HOME_ROOT"
+
+# --- 5. Crear o reparar el home ---------------------------------------------
+CHANGED=0
+if [ ! -d "$HOME_DIR" ]; then
+  install -d -m "$USER_MODE" -o "$UID_NUM" -g "$GID_NUM" "$HOME_DIR"
+  CHANGED=1
+  if [ -d "$SKEL_DIR" ]; then
+    cp -a "${SKEL_DIR}/." "$HOME_DIR/"
+  fi
+fi
+
+# Se ejecuta tambien cuando el home ya existia: el guard [ ! -d ] dejaba homes
+# con el uid equivocado para siempre (alumno1 quedo como 2001 = admin).
+if [ "$(stat -c '%u:%g' "$HOME_DIR")" != "$UID_NUM:$GID_NUM" ]; then
+  CHANGED=1
+fi
+chown "$UID_NUM:$GID_NUM" "$HOME_DIR"
+chmod "$USER_MODE" "$HOME_DIR"
+
+# --- 6. Contenido del home --------------------------------------------------
+# No alcanza con arreglar el directorio raiz: los objetos que hay ADENTRO pueden
+# haber quedado con un UID viejo (o directamente con un UID que ya no existe en
+# LDAP, que ls muestra como UNKNOWN) si se crearon antes de corregir el
+# uidNumber, y con permisos que impiden al usuario escribir dentro.
+#
+# Ejemplo real: /export/home/alumno1/.config quedo como UNKNOWN:investigacion
+# 755. code-server no podia mkdir .config/code-server y la sesion moria al
+# arrancar con "error EACCES: permission denied, mkdir
+# '/export/home/alumno1/.config/code-server'". My Jobs sufria lo mismo con
+# ~/ondemand.
+#
+# El find solo mira el primer elemento fuera de lugar, asi que el caso normal
+# (todo bien) cuesta un unico stat por entrada y no se hace el chown -R.
+STALE="$(find "$HOME_DIR" \( ! -user "$UID_NUM" -o ! -group "$GID_NUM" \) -print -quit 2>/dev/null || true)"
+if [ -n "$STALE" ]; then
+  CHANGED=1
+  # chown -R y NO el modulo file: las apps crean cache y archivos de sesion
+  # dentro, asi que arreglar solo los directorios padre deja los archivos viejos
+  # sin escribir y el error persiste.
+  chown -R "$UID_NUM:$GID_NUM" "$HOME_DIR"
+fi
+
+# Marca para que Ansible pueda distinguir una corrida que toco algo de una que no.
+[ "$CHANGED" -eq 1 ] && echo "CHANGED $USER_NAME"
+exit 0

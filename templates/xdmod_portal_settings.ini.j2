@@ -1,0 +1,141 @@
+; portal_settings.ini de Open XDMoD {{ xdmod_version }}
+;
+; GENERADO POR ANSIBLE. No editar a mano: los cambios se pisan en la próxima
+; corrida del playbook.
+;
+; Estructura calcada de /usr/share/xdmod/templates/portal_settings.template, que
+; es lo que el paso "Database Setup" de xdmod-setup escribe. Como ese asistente
+; es interactivo, esta plantilla reemplaza ese paso.
+;
+; OJO con las secciones: en XDMoD 11 las credenciales del logger viven en
+; [logger]. Las claves sueltas antes de cualquier sección (user=, pass=,
+; database=) son del formato anterior a la 11 y hoy se ignoran.
+
+[general]
+title = "{{ xdmod_title }}"
+site_address = "{{ xdmod_site_address }}"
+contact_page_recipient = "{{ xdmod_admin_email }}"
+tech_support_recipient = "{{ xdmod_admin_email }}"
+
+; Lo actualiza el propio XDMoD durante los upgrades.
+version = "{{ xdmod_version }}"
+
+debug_mode = "{{ xdmod_debug_mode }}"
+debug_recipient = "{{ xdmod_admin_email }}"
+
+exceptions_logfile = "exceptions.log"
+rest_logfile = "rest_exceptions.log"
+login_logfile = "logins.log"
+rest_general_logfile = "rest_general.log"
+extrest_access_logfile = "extrest_general.log"
+extrest_exception_logfile = "extrest_exceptions.log"
+
+center_logo = ""
+center_logo_width = "300"
+
+sql_debug_mode = "{{ xdmod_sql_debug_mode }}"
+
+maintainer_email_signature = "{{ xdmod_admin_email }}"
+
+;; email token settings
+application_secret = "{{ xdmod_application_secret }}"
+email_token_expiration = "600"
+
+[features]
+xsede = "off"
+appkernels = "off"
+multiple_service_providers = "off"
+user_dashboard = "off"
+
+[sso]
+; Poner en "on" habilita el login local del portal, además del SSO.
+show_local_login = "{{ xdmod_show_local_login }}"
+
+[internal]
+dw_desc_cache = "off"
+
+[roadmap]
+url = ""
+header = ""
+
+[rest]
+base = "v1"
+version = "v1.0"
+basic_auth = "on"
+
+[cors]
+domains = ""
+
+[mailer]
+sender_name = "{{ xdmod_mailer_sender_name }}"
+sender_email = "{{ xdmod_admin_email }}"
+subject_prefix = "[XDMoD] "
+captcha_public_key = ""
+captcha_private_key = ""
+
+[reporting]
+; Sin Chromium, XDMoD levanta igual pero todos los reportes con gráficos
+; fallan al generarse.
+chromium_path = "{{ xdmod_chromium_path }}"
+
+[logger]
+db_engine = "MySQLDB"
+host = "localhost"
+port = "3306"
+user = "{{ xdmod_db_user_local }}"
+pass = "{{ xdmod_db_pass_local }}"
+database = "mod_logger"
+table = "log_table"
+email_from = "{{ xdmod_admin_email }}"
+email_to = "{{ xdmod_admin_email }}"
+email_subject = "XDMoD: mensaje del portal"
+default_level_console = "NOTICE"
+default_level_file = "WARNING"
+default_level_db = "INFO"
+default_level_mail = "ERR"
+
+[database]
+db_engine = "MySQLDB"
+host = "localhost"
+port = "3306"
+user = "{{ xdmod_db_user_local }}"
+pass = "{{ xdmod_db_pass_local }}"
+database = "moddb"
+
+; This section applies to modw, modw_aggregates, and modw_filters.
+[datawarehouse]
+db_engine = "MySQLDB"
+host = "localhost"
+port = "3306"
+user = "{{ xdmod_db_user_local }}"
+pass = "{{ xdmod_db_pass_local }}"
+database = "modw"
+rest_logfile = "rest_datawarehouse.log"
+
+[shredder]
+db_engine = "MySQLDB"
+host = "localhost"
+port = "3306"
+user = "{{ xdmod_db_user_local }}"
+pass = "{{ xdmod_db_pass_local }}"
+database = "mod_shredder"
+
+[hpcdb]
+db_engine = "MySQLDB"
+host = "localhost"
+port = "3306"
+user = "{{ xdmod_db_user_local }}"
+pass = "{{ xdmod_db_pass_local }}"
+database = "mod_hpcdb"
+
+[slurm]
+sacct = "{{ xdmod_sacct_path }}"
+
+; Configuration for data warehouse export functionality.
+[data_warehouse_export]
+export_directory = "{{ xdmod_export_dir }}"
+retention_duration_days = "7"
+hash_salt = "{{ xdmod_export_salt }}"
+
+[api_token]
+expiration_interval = "6 months"

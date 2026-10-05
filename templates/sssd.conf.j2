@@ -1,0 +1,42 @@
+[sssd]
+config_file_version = 2
+services = nss, pam
+domains = LDAP
+
+[nss]
+filter_groups = root,slurm,munge
+filter_users = root,slurm,munge
+reconnection_retries = 3
+
+[pam]
+reconnection_retries = 3
+
+[domain/LDAP]
+id_provider = ldap
+auth_provider = ldap
+chpass_provider = ldap
+
+ldap_uri = {{ ldap_uri }}
+ldap_search_base = {{ ldap_search_base }}
+ldap_user_search_base = {{ ldap_user_search_base }}
+ldap_group_search_base = {{ ldap_group_search_base }}
+
+ldap_default_bind_dn = {{ ldap_default_bind_dn }}
+ldap_default_authtok = {{ ldap_default_authtok }}
+
+ldap_user_object_class = posixAccount
+ldap_user_name = uid
+ldap_user_uid_number = uidNumber
+ldap_user_gid_number = gidNumber
+ldap_user_home_directory = homeDirectory
+ldap_user_shell = loginShell
+
+ldap_group_object_class = posixGroup
+ldap_group_name = cn
+ldap_group_gid_number = gidNumber
+
+ldap_tls_reqcert = {{ ldap_tls_reqcert | default('never') }}
+
+cache_credentials = true
+entry_cache_timeout = 600
+enumerate = false
