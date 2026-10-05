@@ -86,8 +86,6 @@ Despliegue **100% automatizado** de un clúster [Slurm Workload Manager](https:/
 ```bash
 # Instalar la colección ansible.posix (una sola vez)
 ansible-galaxy collection install ansible.posix
-
-# (Opcional) encriptación de secretos
 ansible-vault --version
 ```
 
@@ -95,12 +93,21 @@ ansible-vault --version
 
 | Requisito | Valor |
 |---|---|
-| SO | Ubuntu 24.04/22.04 o Debian 12 (compatible con los `.deb` compilados) |
+| SO | Ubuntu 24.04/22.04 o Debian 12 |
 | Arquitectura | `amd64` |
-| Recursos | CPU × N, RAM según carga, GPUs NVIDIA/AMD (opcionales) |
-| Red | Toda la subred nodos accesible; puertos 6817/6818/6819/3306/2049 abiertos |
+| Red | Subred accesible; puertos 6817/6818/6819/3306/2049 abiertos |
 
-- Los paquetes `.deb` de Slurm deben estar **compilados para la misma distro** de los nodos (ver [sección paquetes](#3-paquetes-slurm-locales-deb)).
+- Los paquetes `.deb` de Slurm deben estar compilados para la misma distro.
+
+### Prerrequisitos manuales (bootstrap)
+
+El playbook no crea cuentas SSH ni IPs. Antes de ejecutar `playbook.yml`:
+
+| Elemento | Detalle |
+|---|---|
+| Usuarios SSH | `master` (slurmmaster), `work` (worker1), `work2` (worker2) con `sudo`. |
+| IPs | `192.168.18.185` (slurmmaster/slurmdb/slurmod/slurmldap), `192.168.18.175` (worker1), `192.168.18.177` (worker2). |
+| Secrets | Gestionados con `ansible-vault` (`.vault_pass` fuera del repo). |
 
 ---
 
@@ -242,6 +249,12 @@ El playbook es **idempotente**: ejecutarlo dos veces no duplica instalaciones ni
 | 5 | Cómputo | Detección remota de GPU/vendor, instala `slurmd`, despliega `cgroup.conf`, `gres.conf` y `slurm.conf`, arranca `slurmd` |
 | 6 | Apptainer | Llave GPG del PPA, repo `apptainer`, instala `apptainer`/`apptainer-suid`, bind de `/shared` |
 | 7 | Reconciliación | `wait_for` 6819, regenera `slurm.conf` en master, `scontrol reconfigure`, y `state=RESUME reason=""` (limpieza de DRAIN) |
+| — | LDAP | `slapd` con TLS (LDAPS), LDIF de árbol base, usuarios de prueba, SSSD en nodos |
+| — | Open OnDemand | Repo OOD 4.2.4, Apache + PUN, apps interactivas (Jupyter, VS Code, Terminal Web), Grafana con `auth.proxy` |
+| — | Grafana | `auth.proxy` vía cabecera `X-WEBAUTH-USER`, dashboard de clúster |
+| — | Prometheus | Node Exporter + Slurm exporter + timer de scrape |
+
+> Los plays de OOD, Grafana y Prometheus están agrupados aquí por función; el orden real está en `playbook.yml` (`hosts:` de cada bloque).
 
 ---
 
