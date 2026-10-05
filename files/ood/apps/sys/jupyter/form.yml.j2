@@ -11,6 +11,7 @@ form:
   - bc_num_hours
   - bc_num_cores
   - bc_memory
+  - slurm_args
   - working_dir
 
 attributes:
@@ -32,6 +33,13 @@ attributes:
     max: "{{ interactive_memory_max_mb }}"
     step: "256"
     widget: "number_field"
+  slurm_args:
+    label: "Argumentos Slurm (opcional)"
+    widget: "text"
+    value: ""
+    help: "Solo flags permitidos: --mem, --cpus-per-task, --gres, --time, -J, --partition (se validarán al generar el script)"
+    placeholder: "--mem=8G --cpus-per-task=4"
+
   working_dir:
     label: "Directorio de trabajo"
     widget: "path_selector"

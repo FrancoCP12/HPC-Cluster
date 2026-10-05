@@ -4,6 +4,22 @@ batch_connect:
 
 script:
   native:
+<%-
+  allowed = /\A(--mem(=|\s+)[^\s]+|--cpus-per-task(=|\s+)\d+|--gres(=|\s+)[^\s]+|--time(=|\s+)[^\s]+|-J(=|\s+)[^\s]+|--partition(=|\s+)[^\s]+)(\s+|\z)/i
+  args = bc_slurm_args.to_s.strip
+  if args != ""
+    tokens = args.split(/[[:space:]]+/)
+    bad = tokens.any? { |t| !(t =~ allowed) }
+    if bad
+      raise "Argumentos Slurm no permitidos. Solo: --mem, --cpus-per-task, --gres, --time, -J, --partition"
+    end
+  end
+-%>
+<% if args != "" -%>
+<% args.split(/[[:space:]]+/).each do |t| -%>
+    - "#SBATCH <%= t %>"
+<% end -%>
+<% end -%>
     - "--partition"
     - "{{ slurm_partition_name }}"
     - "-N"

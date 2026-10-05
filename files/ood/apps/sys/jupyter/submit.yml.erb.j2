@@ -8,7 +8,42 @@ batch_connect:
     - jupyter_api
 
 script:
+
+<%-
+  # Validación whitelist de Custom Slurm Args
+  allowed = /\A(--mem(=|\s+)[^\s]+|--cpus-per-task(=|\s+)\d+|--gres(=|\s+)[^\s]+|--time(=|\s+)[^\s]+|-J(=|\s+)[^\s]+|--partition(=|\s+)[^\s]+)(\s+|\z)/i
+  args = bc_slurm_args.to_s.strip
+  if args != ""
+    tokens = args.split(/[[:space:]]+/)
+    bad = tokens.any? { |t| !(t =~ allowed) }
+    if bad
+      raise "Argumentos Slurm no permitidos. Solo: --mem, --cpus-per-task, --gres, --time, -J, --partition"
+    end
+  end
+-%>
+<% if args != "" -%>
+# Custom Slurm arguments (validados)
+<% args.split(/[[:space:]]+/).each do |t| -%>
+#SBATCH <%= t %>
+<% end -%>
+<% end -%>
   native:
+<%-
+  allowed = /\A(--mem(=|\s+)[^\s]+|--cpus-per-task(=|\s+)\d+|--gres(=|\s+)[^\s]+|--time(=|\s+)[^\s]+|-J(=|\s+)[^\s]+|--partition(=|\s+)[^\s]+)(\s+|\z)/i
+  args = bc_slurm_args.to_s.strip
+  if args != ""
+    tokens = args.split(/[[:space:]]+/)
+    bad = tokens.any? { |t| !(t =~ allowed) }
+    if bad
+      raise "Argumentos Slurm no permitidos. Solo: --mem, --cpus-per-task, --gres, --time, -J, --partition"
+    end
+  end
+-%>
+<% if args != "" -%>
+<% args.split(/[[:space:]]+/).each do |t| -%>
+    - "#SBATCH <%= t %>"
+<% end -%>
+<% end -%>
     # La partición tiene que existir en slurm.conf. Pedir una inexistente hace
     # que sbatch falle al enviar el job y el usuario nunca ve nada.
     - "--partition"

@@ -6,6 +6,7 @@ form:
   - bc_num_hours
   - bc_num_cores
   - bc_memory
+  - slurm_args
 
 attributes:
   bc_num_hours:
@@ -19,6 +20,13 @@ attributes:
     max: "{{ interactive_num_cores_max }}"
     step: "1"
     widget: "number_field"
+  slurm_args:
+    label: "Argumentos Slurm (opcional)"
+    widget: "text"
+    value: ""
+    help: "Solo flags permitidos: --mem, --cpus-per-task, --gres, --time, -J, --partition (se validarán al generar el script)"
+    placeholder: "--mem=8G --cpus-per-task=4"
+
   bc_memory:
     label: "Memoria (MiB)"
     value: "{{ interactive_memory_default_mb }}"
