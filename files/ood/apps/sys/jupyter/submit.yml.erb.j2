@@ -1,0 +1,23 @@
+---
+# App Batch Connect genérica (template "basic" de ood_core). Los helpers
+# find_port / create_passwd / wait_until_port_used los provee el template
+# basic: NO hay que instalarlos.
+batch_connect:
+  template: "basic"
+  conn_params:
+    - jupyter_api
+
+script:
+  native:
+    # La partición tiene que existir en slurm.conf. Pedir una inexistente hace
+    # que sbatch falle al enviar el job y el usuario nunca ve nada.
+    - "--partition"
+    - "{{ slurm_partition_name }}"
+    - "-N"
+    - "1"
+    - "--ntasks-per-node"
+    - "<%= bc_num_cores.to_i %>"
+    - "--mem"
+    - "<%= bc_memory.to_i %>M"
+    - "-t"
+    - "<%= bc_num_hours %>"

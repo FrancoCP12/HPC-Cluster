@@ -1,0 +1,16 @@
+---
+batch_connect:
+  template: "basic"
+
+script:
+  native:
+    - "--partition"
+    - "{{ slurm_partition_name }}"
+    - "-N"
+    - "1"
+    - "--ntasks-per-node"
+    - "<%= bc_num_cores.to_i %>"
+    - "--mem"
+    - "<%= bc_memory.to_i %>M"
+    - "-t"
+    - "<%= bc_num_hours %>"

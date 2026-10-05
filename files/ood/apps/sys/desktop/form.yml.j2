@@ -1,0 +1,39 @@
+---
+# Misma convencion que jupyter/codeserver: solo el cluster declarado.
+cluster:
+  - "{{ slurm_cluster_name }}"
+
+form:
+  - bc_num_hours
+  - bc_num_cores
+  - bc_memory
+  - bc_vnc_resolution
+
+attributes:
+  bc_num_hours:
+    label: "Duracion maxima"
+    value: "04:00:00"
+    widget: "text"
+  bc_num_cores:
+    label: "Cores"
+    value: "{{ interactive_num_cores_default }}"
+    min: "1"
+    max: "{{ interactive_num_cores_max }}"
+    step: "1"
+    widget: "number_field"
+  bc_memory:
+    label: "Memoria (MiB)"
+    value: "{{ interactive_memory_default_mb }}"
+    min: "256"
+    max: "{{ interactive_memory_max_mb }}"
+    step: "256"
+    widget: "number_field"
+  bc_vnc_resolution:
+    label: "Resolucion"
+    value: "1280x800"
+    widget: "select"
+    options:
+      - "1024x768"
+      - "1280x800"
+      - "1440x900"
+      - "1920x1080"

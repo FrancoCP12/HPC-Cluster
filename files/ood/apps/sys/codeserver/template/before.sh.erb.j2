@@ -1,0 +1,7 @@
+# Corre en el nodo de login, antes de enviar el job al planificador.
+# find_port lo provee el template "basic" de ood_core.
+
+port="$(find_port "${host}")"
+password="$(create_passwd 16)"
+
+export port password

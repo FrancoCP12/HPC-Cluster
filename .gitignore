@@ -1,0 +1,32 @@
+# Ansible
+*.retry
+.ansible/
+.vault_pass
+*.vault
+# Secrets/env
+.env
+# Session/notes
+*.md
+# Logs
+*.log
+# Editor
+*.swp
+*.swo
+*~
+# OS
+.DS_Store
+Thumbs.db
+# Avoid committing local backups if any
+*.orig
+*.bak
+# But DO track the files/ and packages needed for a virgin run
+!files/
+!files/**
+!packages/
+!packages/ubuntu26/
+!packages/ubuntu26/**
+# Exclude other package dirs not needed
+packages/Rocky/
+# Keep templates tracked (already are)
+!templates/
+!templates/**

@@ -1,0 +1,35 @@
+# Corre en el nodo de login, antes de enviar el job al planificador.
+# Los helpers find_port / create_passwd los provee el template "basic" de
+# ood_core: no hay que instalarlos ni definirlos aca.
+
+port="$(find_port "${host}")"
+SALT="$(create_passwd 16)"
+password="$(create_passwd 16)"
+PASSWORD_SHA1="$(echo -n "${password}${SALT}" | openssl dgst -sha1 | awk '{print $NF}')"
+
+# conn_params de submit.yml pide 'jupyter_api', que OOD lee del entorno
+# exportado por el batch job.
+export jupyter_api="lab"
+
+export port SALT password PASSWORD_SHA1
+
+# El path_selector puede devolver cualquier cosa: se filtra antes de interpolarlo
+# en un archivo de configuracion.
+#
+# El campo NO se puede referenciar directo. working_dir es un atributo opcional
+# y BatchConnect::Session::TemplateBinding solo define los atributos que el
+# navegador mando. Con el widget path_selector sin eleccion, el campo no viaja
+# en el POST y la referencia directa a working_dir abortaba el launch con
+# "undefined local variable or method 'working_dir' for an instance of
+# BatchConnect::Session::TemplateBinding". defined? no lanza NameError, asi que
+# el template degrada a $HOME en vez de fallar.
+<% if defined?(working_dir) && !working_dir.to_s.strip.empty? -%>
+working_dir="<%= working_dir.to_s.gsub(/[^A-Za-z0-9_\/.~ -]/, '') %>"
+<% else -%>
+working_dir=""
+<% end -%>
+if [[ -n "$working_dir" && -r "$working_dir" ]]; then
+  export NOTEBOOK_ROOT="$working_dir"
+else
+  export NOTEBOOK_ROOT="$HOME"
+fi

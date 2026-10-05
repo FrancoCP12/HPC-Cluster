@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Corre en el nodo de cómputo.
+export PASSWORD_FILE="${PWD}/password"
+printf '%s' "${password}" > "${PASSWORD_FILE}"
+chmod 600 "${PASSWORD_FILE}"
+
+# El password va por el entorno $PASSWORD y NO por el flag --password.
+# code-server 4.x rechaza el flag cuando ya existe un config file del usuario
+# (/export/home/<user>/.config/code-server/config.yaml, que se autogenera en el
+# primer arranque) y aborta con:
+#   error --password can only be set in the config file or passed in via $PASSWORD
+# Con $PASSWORD no hay ambigüedad y funciona en los dos casos.
+export PASSWORD="${password}"
+
+# Ruta absoluta y sin 'module': este clúster no tiene Lmod en los nodos.
+exec /usr/bin/code-server \
+  --bind-addr "0.0.0.0:${port}" \
+  --auth password \
+  --cert false \
+  "$HOME"

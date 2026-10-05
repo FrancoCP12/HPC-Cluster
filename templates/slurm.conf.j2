@@ -52,4 +52,4 @@ NodeName={{ node_host }} NodeAddr={{ node_ip }} CPUs={{ cpus }} RealMemory={{ me
 
 # Definición de Partición
 
-PartitionName=general Nodes={% for node in groups['compute'] %}{{ hostvars[node]['ansible_facts']['hostname'] | default(node) }}{% if not loop.last %},{% endif %}{% endfor %} Default=YES MaxTime=INFINITE State=UP
+PartitionName={{ slurm_partition_name }} Nodes={% for node in groups['compute'] %}{{ hostvars[node]['ansible_facts']['hostname'] | default(node) }}{% if not loop.last %},{% endif %}{% endfor %} Default=YES MaxTime=INFINITE State=UP

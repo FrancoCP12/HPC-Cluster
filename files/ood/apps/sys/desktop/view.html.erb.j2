@@ -1,0 +1,80 @@
+<%-
+  # --- Cliente noVNC: DECISION DE USAR EL 1.3.0 BUNDLEADO CON OOD ---------
+  #
+  # Se usa el noVNC 1.3.0 que trae la app dashboard de OOD, cuya ruta y
+  # version dependen de la version de OOD instalada:
+  #     /var/www/ood/apps/sys/dashboard/public/noVNC-1.3.0
+  # (Ojo: el paquete 'novnc' de la distro SI esta instalado en la PUN, en
+  #  /usr/share/novnc, version 1.6.0. Va para el wrapper /opt/websockify/run
+  #  con su --web; esta app NO lo usa porque llama /usr/bin/websockify
+  #  directo. O sea que el 1.6.0 esta instalado pero nadie lo consume.)
+  #
+  # DECISION: quedarse con el 1.3.0 y NO migrar al 1.6.0 de la distro.
+  #
+  # POR QUE NO SE MIGRA (esto es lo importante, no lo casual):
+  # las dos versiones arman la URL del websocket de forma distinta.
+  #
+  #   noVNC 1.3.0  app/ui.js:165,1074-1079
+  #     UI.initSetting('host', window.location.hostname);   # host por defecto
+  #     url = 'wss://' + host [+ ':' + port] + '/' + path;  # path DESDE LA RAIZ
+  #     -> wss://<host>/rnode/work/4620/websockify
+  #        que matchea  <LocationMatch "^/rnode/...">  del vhost OOD.
+  #
+  #   noVNC 1.6.0  app/ui.js:1070-1072
+  #     url = new URL(path, location.href);   # path RELATIVO A LA PAGINA
+  #     -> https://<host>/pun/sys/dashboard/noVNC-1.6.0/rnode/work/4620/websockify
+  #        que NO matchea el LocationMatch de la raiz y el ws nunca conecta.
+  #
+  # O sea: migrar exige cambiar ws_path a "/rnode/..." (con slash inicial),
+  # cambiar novnc_url, y servir /usr/share/novnc por Apache. Los otros tres
+  # parametros de esta vista SI son compatibles con 1.6.0 y no hay que tocarlos:
+  #   autoconnect=true -> ui.js:137 acepta 'true' y '1'
+  #   resize=remote    -> ui.js:1353 resizeSession === 'remote'
+  #   #password=       -> webutil.js:60, el fragment tiene precedencia
+  #
+  # CONSECUENCIA ACEPTADA DE ESTA DECISION:
+  # si alguna vez se actualiza OOD y cambia el noVNC que trae el dashboard,
+  # esta ruta deja de existir y el boton "Conectar" abre una pestana con 404
+  # CUANDO EL JOB DE SLURM YA ESTA CORRIENDO, o sea el fallo aparece tarde y
+  # con recursos ya consumidos. Hay que cerrar la sesion desde el dashboard.
+  #
+  # PROBABILIDAD: baja. OOD esta pineado en 4.2.4 y el repo de 4.3 da 404, asi
+  # que no se actualiza por accidente. Solo se dispara si alguien sube de
+  # version a proposito.
+  #
+  # QUE HACER SI SE ACTIVA EL RIESGO: revisar que exista
+  #   ls -d /var/www/ood/apps/sys/dashboard/public/noVNC-*
+  # y actualizar novnc_url con la version que aparezca. Si ademas se quiere
+  # migrar al 1.6.0, aplicar los tres cambios de arriba y PROBAR en navegador
+  # con una sesion de Slurm viva: el fallo (ws que no conecta) no se puede
+  # reproducir sin un job real corriendo.
+  novnc_url = "/pun/sys/dashboard/noVNC-1.3.0/vnc.html"
+  ws_path   = "rnode/#{host}/#{websocket}/websockify"
+  form_id   = "novnc_form"
+-%>
+<!-- El password viaja en el fragment (#) de la URL, nunca en el query
+     string: si fuera en ?password=... quedaria escrito en el access log de
+     nginx de la PUN. Por eso el submit se intercepta con JS. -->
+<script type="text/javascript">
+  document.getElementById("<%= form_id %>").addEventListener("submit", function (e) {
+    e.preventDefault();
+    var qs  = new URLSearchParams(new FormData(this)).toString();
+    var pw  = this.querySelector("[name=password]").value;
+    window.open(this.action + "?" + qs + "#password=" + encodeURIComponent(pw), "_blank");
+  });
+</script>
+
+<form id="<%= form_id %>" action="<%= novnc_url %>" method="get" target="_blank">
+  <input type="hidden" name="autoconnect" value="true">
+  <input type="hidden" name="path" value="<%= ws_path %>">
+  <input type="hidden" name="resize" value="remote">
+  <input type="hidden" name="password" value="<%= password %>">
+  <button class="btn btn-primary" type="submit">
+    <i class="fa fa-desktop"></i> Conectar a la Terminal Web
+  </button>
+</form>
+
+<p class="help-block">
+  Se abre noVNC en una pestana nueva. La sesion de Slurm queda viva el tiempo
+  solicitado y hay que cerrarla desde el dashboard para liberar los recursos.
+</p>

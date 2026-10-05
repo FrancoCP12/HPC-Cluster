@@ -1,0 +1,38 @@
+<%-
+  # code-server arranca con '--auth password', asi que SIEMPRE pide login.
+  # Antes este view solo mostraba un link: el usuario llegaba a la pantalla de
+  # password sin ninguna forma de conocerlo. El password es aleatorio por
+  # sesion (create_passwd 16 en before.sh.erb), no hay un valor fijo.
+  #
+  # El form de login de code-server es un POST plano a /login con campo
+  # 'password' (verificado en 4.140.0 leyendo el HTML de /login), asi que se
+  # puede postear solo. 'base' hace que el redirect post-login caiga en el
+  # path del proxy y no en la raiz del host de compute.
+  base_url = "/rnode/#{host}/#{port}"
+  form_id  = "codeserver_form"
+-%>
+
+<form id="<%= form_id %>" action="<%= base_url %>/login" method="post" target="_blank">
+  <input type="hidden" name="password" value="<%= password %>">
+  <input type="hidden" name="base" value="<%= base_url %>/">
+  <input type="hidden" name="href" value="">
+  <button class="btn btn-primary" type="submit">
+    <i class="fa fa-code"></i> Connect to VS Code
+  </button>
+</form>
+
+<p class="help-block">
+  Si la pestana no abre VS Code autenticado, el password de esta sesion es:
+  <code id="codeserver_password"><%= password %></code>
+</p>
+
+<script type="text/javascript">
+  // El password va en el body del POST, no en la query string, asi que no
+  // queda en el access log de nginx. El auto-submit abre la pestana con la
+  // sesion ya iniciada; si el proxy falla en algo, el password queda escrito
+  // arriba para tipearlo a mano.
+  document.addEventListener("DOMContentLoaded", function () {
+    var f = document.getElementById("<%= form_id %>");
+    if (f) { f.submit(); }
+  });
+</script>

@@ -1,0 +1,28 @@
+# Corre en el nodo de calculo, antes de que arranque script.sh.
+# Los helpers find_port / create_passwd / wait_until_port_used los define el
+# template "basic" de ood_core: NO hay que instalarlos aca.
+
+# Puerto RFB de VNC. Se busca DENTRO del rango de displays (5910..5999) para
+# que el numero de display salga del puerto elegido y no al reves: si el
+# puerto esta libre, el display :N no tiene servidor X previo.
+# Xvnc igual crea /tmp/.X11-unix/XN, pero asi no hay colisiones entre dos
+# sesiones del mismo usuario en el mismo nodo.
+vnc_port="$(find_port localhost 5910 5999)" || exit 1
+display=$(( vnc_port - 5900 ))
+
+# Puerto donde escucha websockify. Es el que la PUN alcanza en
+# /rnode/<host>/<puerto>/websockify para hacer el upgrade a WebSocket.
+websocket="$(find_port "${host}")" || exit 1
+
+# Password del VNC. Viaja a connection.yml (el template basic lo agrega solo a
+# conn_params) y de ahi al fragment de la URL de noVNC.
+password="$(create_passwd 8)"
+
+# bc_vnc_resolution viene del form; se valida porque interpola directo en la
+# linea de comando de Xvnc.
+case "${bc_vnc_resolution}" in
+  [0-9]*x[0-9]*) resolution="${bc_vnc_resolution}" ;;
+  *) resolution="1280x800" ;;
+esac
+
+export vnc_port display websocket password resolution

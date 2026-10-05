@@ -18,11 +18,12 @@ Despliegue **100% automatizado** de un clúster [Slurm Workload Manager](https:/
    - [Paquetes Slurm locales (.deb)](#3-paquetes-slurm-locales-deb)
 6. [Ejecución del playbook](#ejecución-del-playbook)
 7. [Qué hace cada play](#qué-hace-cada-play)
-8. [Validación post-despliegue](#validación-post-despliegue)
-9. [Detección de GPU](#detección-de-gpu)
-10. [Seguridad](#seguridad)
-11. [Solución de problemas](#solución-de-problemas)
-12. [Soporte y contribución](#soporte-y-contribución)
+8. [Decisiones técnicas y compromisos asumidos](#decisiones-técnicas-y-compromisos-asumidos)
+9. [Validación post-despliegue](#validación-post-despliegue)
+10. [Detección de GPU](#detección-de-gpu)
+11. [Seguridad](#seguridad)
+12. [Solución de problemas](#solución-de-problemas)
+13. [Soporte y contribución](#soporte-y-contribución)
 
 ---
 
@@ -241,6 +242,83 @@ El playbook es **idempotente**: ejecutarlo dos veces no duplica instalaciones ni
 | 5 | Cómputo | Detección remota de GPU/vendor, instala `slurmd`, despliega `cgroup.conf`, `gres.conf` y `slurm.conf`, arranca `slurmd` |
 | 6 | Apptainer | Llave GPG del PPA, repo `apptainer`, instala `apptainer`/`apptainer-suid`, bind de `/shared` |
 | 7 | Reconciliación | `wait_for` 6819, regenera `slurm.conf` en master, `scontrol reconfigure`, y `state=RESUME reason=""` (limpieza de DRAIN) |
+
+---
+
+## Decisiones técnicas y compromisos asumidos
+
+Esta sección registra decisiones donde se eligió **no** arreglar algo, con el motivo
+y la consecuencia aceptada. Está para que nadie "lo arregle" sin saber que fue
+deliberado.
+
+### Cliente noVNC: se usa el 1.3.0 que trae OOD, no el 1.6.0 de la distro
+
+**Decisión.** La app `desktop` (Terminal Web) abre el noVNC **1.3.0** empaquetado
+dentro de la app `dashboard` de OOD:
+
+```
+/var/www/ood/apps/sys/dashboard/public/noVNC-1.3.0
+```
+
+No se migra al paquete `novnc` de la distro (1.6.0 en `/usr/share/novnc`).
+
+**Por qué.** Las dos versiones arman la URL del websocket de forma incompatible,
+y de eso depende toda la conexión:
+
+| Versión | Cómo arma la URL | Resultado |
+|---|---|---|
+| 1.3.0 | `url = 'wss://' + host + '/' + path` (raíz) | `wss://host/rnode/work/4620/websockify` ✅ matchea `LocationMatch "^/rnode/..."` |
+| 1.6.0 | `url = new URL(path, location.href)` (relativo a la página) | `.../pun/sys/dashboard/noVNC-1.6.0/rnode/...` ❌ no matchea el vhost |
+
+El proxy `/rnode/` está en la **raíz** del vhost OOD, y el path que produce 1.6.0
+cae debajo de `/pun/sys/dashboard/`, o sea que el websocket nunca se establecería.
+
+**Consecuencia aceptada.** Si alguna vez se actualiza OOD y cambia el noVNC que
+trae el `dashboard`, la ruta deja de existir y el botón **Conectar** abre una
+pestaña con `404` — y lo hace **después** de que el job de Slurm ya arrancó,
+consumiendo recursos hasta que expire la sesión. Es un fallo tardío, no un
+fallo de arranque.
+
+**Probabilidad: baja.** OOD está pineado en `4.2.4` y el repo de `4.3` devuelve
+`404`, así que no se actualiza por accidente. Solo se dispara si alguien sube de
+versión a propósito.
+
+**Qué hacer si se activa el riesgo.**
+
+```bash
+# 1. Ver qué versión trae ahora el dashboard de OOD
+ls -d /var/www/ood/apps/sys/dashboard/public/noVNC-*
+
+# 2. Actualizar novnc_url en files/ood/apps/sys/desktop/view.html.erb.j2
+#    con esa versión y redesplegar:
+ansible-playbook playbook.yml --tags ood,interactive,vnc
+```
+
+Para **migrar además** al 1.6.0 hacen falta tres cambios, no uno:
+
+1. Servir `/usr/share/novnc` desde Apache (`Alias`/`Location`), porque hoy no lo
+   sirve nadie — el wrapper `/opt/websockify/run` lo usa con su `--web` interno,
+   no es un vhost.
+2. Cambiar `novnc_url` a la nueva ruta.
+3. **Poner el slash inicial en `ws_path`**: de `rnode/...` a `/rnode/...`.
+
+Los otros tres parámetros de la vista ya son compatibles con 1.6.0 y no hay que
+tocarlos:
+
+| Parámetro | 1.6.0 | Referencia |
+|---|---|---|
+| `autoconnect=true` | funciona (acepta `'true'` y `'1'`) | `app/ui.js:137` |
+| `resize=remote` | funciona (`resizeSession`) | `app/ui.js:1353` |
+| `#password=` | funciona (el fragment tiene precedencia) | `app/webutil.js:60` |
+
+> ⚠️ Esta migración **no se puede validar sin navegador**: el síntoma (el ws no
+> conecta) solo aparece con una sesión de Slurm viva. Por eso queda documentada
+> y no aplicada.
+
+**Nota.** El paquete `novnc` 1.6.0 **sí está instalado** en la PUN, pero lo
+consume el wrapper `/opt/websockify/run`, no esta app (que llama
+`/usr/bin/websockify` directo). Es decir: está disponible como ruta de migración
+si algún día se decide, pero hoy está inactivo.
 
 ---
 

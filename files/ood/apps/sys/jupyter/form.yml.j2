@@ -1,0 +1,40 @@
+---
+# Solo se declara el cluster que existe en /etc/ood/config/clusters.d.
+cluster:
+  - "{{ slurm_cluster_name }}"
+
+# 'form' lista los campos que se renderizan. No se referencian atributos
+# auto_* / global_* de otro sitio: esos viven en
+# /etc/ood/config/ondemand.d/form.defaults.ondemand.yml y acá no existen, así
+# que referenciarlos hacía que el formulario quedara vacío o inválido.
+form:
+  - bc_num_hours
+  - bc_num_cores
+  - bc_memory
+  - working_dir
+
+attributes:
+  bc_num_hours:
+    label: "Duración maxima"
+    value: "02:00:00"
+    widget: "text"
+  bc_num_cores:
+    label: "Cores"
+    value: "{{ interactive_num_cores_default }}"
+    min: "1"
+    max: "{{ interactive_num_cores_max }}"
+    step: "1"
+    widget: "number_field"
+  bc_memory:
+    label: "Memoria (MiB)"
+    value: "{{ interactive_memory_default_mb }}"
+    min: "256"
+    max: "{{ interactive_memory_max_mb }}"
+    step: "256"
+    widget: "number_field"
+  working_dir:
+    label: "Directorio de trabajo"
+    widget: "path_selector"
+    show_hidden: false
+    show_files: false
+    help: "Directorio desde el que abre Jupyter; por defecto $HOME"

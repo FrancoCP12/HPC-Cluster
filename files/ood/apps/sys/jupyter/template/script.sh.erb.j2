@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Corre en el nodo de cómputo. La config se escribe ACA y no en before.sh.erb
+# porque base_url necesita el hostname real del nodo de cómputo, que en un
+# clúster con más de un nodo no es el de login.
+export CONFIG_FILE="${PWD}/config.py"
+COMPUTE_HOST="$(hostname)"
+
+cd "${NOTEBOOK_ROOT}" || cd "$HOME"
+
+(
+umask 077
+cat > "${CONFIG_FILE}" << EOL
+c.ServerApp.ip = '*'
+c.ServerApp.port = ${port}
+c.ServerApp.base_url = '/node/${COMPUTE_HOST}/${port}/'
+c.ServerApp.port_retries = 0
+c.ServerApp.password = u'sha1:${SALT}:${PASSWORD_SHA1}'
+c.ServerApp.open_browser = False
+c.ServerApp.notebook_dir = '${NOTEBOOK_ROOT}'
+c.ServerApp.disable_check_xsrf = True
+c.KernelSpecManager.ensure_native_kernel = False
+c.NotebookApp.ip = '*'
+c.NotebookApp.port = ${port}
+c.NotebookApp.base_url = '/node/${COMPUTE_HOST}/${port}/'
+c.NotebookApp.password = u'sha1:${SALT}:${PASSWORD_SHA1}'
+c.NotebookApp.open_browser = False
+c.NotebookApp.notebook_dir = '${NOTEBOOK_ROOT}'
+EOL
+)
+
+# Se invoca por ruta absoluta y sin 'module': este clúster no tiene Lmod
+# instalado en los nodos, y 'module purge' abortaba el script.
+# /opt/jupyter/bin/jupyter es el venv con jupyterlab: el jupyter del sistema
+# (/usr/bin/jupyter) no trae jupyterlab y falla con
+# "Jupyter command `jupyter-lab` not found".
+exec /opt/jupyter/bin/jupyter lab --config="${CONFIG_FILE}"

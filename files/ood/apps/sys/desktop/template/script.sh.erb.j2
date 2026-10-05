@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# Corre en el nodo de calculo y es el proceso que OOD espera: mientras este
+# vivo, la sesion figura RUNNING y connection.yml ya se puede leer.
+set -uo pipefail
+
+export DISPLAY=":${display}"
+
+# --- 1) password del VNC ------------------------------------------------
+# vncpasswd -f toma el password de stdin (por eso va dos veces) y escribe el
+# archivo ofuscado que espera -rfbauth. -rfbauth es alias de -PasswordFile.
+vnc_pass_file="${PWD}/vncpasswd"
+printf '%s\n%s\n' "${password}" "${password}" | vncpasswd -f > "${vnc_pass_file}"
+chmod 600 "${vnc_pass_file}"
+
+# --- 2) servidor X -----------------------------------------------------
+# Esta build de Xvnc no tiene servidor HTTP embutido (no existe -httpport),
+# asi que queda expuesto solo el puerto RFB.
+# El puerto va con -rfbport: un numero suelto al final se interpreta como
+# opcion desconocida y Xvnc muere con "Unrecognized option: 59xx".
+/usr/bin/Xvnc "${DISPLAY}" \
+  -rfbport "${vnc_port}" \
+  -geometry "${resolution}" \
+  -depth 24 \
+  -rfbauth "${vnc_pass_file}" \
+  -SecurityTypes VncAuth \
+  -AlwaysShared \
+  -desktop "OOD Terminal" &
+XVNC_PID=$!
+
+# El socket X tiene que existir antes de|matchbox| o xterm.
+for _ in $(seq 1 60); do
+  [[ -S "/tmp/.X11-unix/X${display}" ]] && break
+  if ! kill -0 "${XVNC_PID}" 2>/dev/null; then
+    echo "Xvnc no arranco: ver ${PWD}/Xvnc.log"
+    exit 1
+  fi
+  sleep 0.5
+done
+
+# --- 3) puente WebSocket ----------------------------------------------
+# El proxy /rnode/ de la PUN termina de hacer el resto. Este es el que tiene
+# que imprimir "proxying from :<puerto>" en el log.
+/usr/bin/websockify --heartbeat=30 "${websocket}" "localhost:${vnc_port}" \
+  > "./websockify.log" 2>&1 &
+WS_PID=$!
+
+# --- 4) escritorio minimo ---------------------------------------------
+# No hay gnome/kde/mate en el nodo (y no se instalan: son cientos de MB por
+# nodo). Con matchbox alcanza: levanta xterm a pantalla completa.
+/usr/bin/matchbox-window-manager -use_titlebar no &
+sleep 1
+/usr/bin/xterm \
+  -fa Monospace -fs 11 \
+  -bg '#0c0c14' -fg '#e6e6e6' \
+  -T "OOD Terminal - ${USER}@${HOSTNAME}" \
+  -e /bin/bash -l &
+
+# --- 5) la sesion vive mientras Xvnc viva -----------------------------
+# Si Xvnc muere, el script termina, OOD marca la sesion como terminada y el
+# proxy /rnode/ deja de dar servicio.
+wait "${XVNC_PID}"

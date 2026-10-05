@@ -1,0 +1,8 @@
+# Espera a que el servidor abra el puerto antes de cerrar la sesión.
+echo "Waiting for code-server to open port ${port}..."
+if wait_until_port_used "${host}:${port}" 600; then
+  echo "code-server is listening on ${host}:${port}."
+else
+  echo "Timed out waiting for code-server on port ${port}."
+  clean_up 1
+fi

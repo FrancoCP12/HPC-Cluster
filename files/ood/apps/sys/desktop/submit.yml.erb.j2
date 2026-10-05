@@ -1,0 +1,39 @@
+---
+# Template "basic" de ood_core: la app trae su propio script, asi que no se
+# usa el template "vnc".
+#
+# POR QUE NO el template "vnc" (que es el que usa bc_desktop):
+# vnc.rb fue escrito para TurboVNC y con TigerVNC 1.15 falla en cuatro puntos,
+# todos verificados en los nodos:
+#   1) invoca 'vncserver -log FILE'  -> Xtigervnc: "Unrecognized option: -Log"
+#   2) espera el proceso con 'pgrep -s 0 Xvnc' (session 0): el daemon de
+#      TigerVNC se va a otra sesion, y el binario se llama Xtigervnc
+#   3) saca el display con awk '/^Desktop/' -> TigerVNC imprime
+#      "New Xtigervnc server ... for display :N", sin linea "Desktop:"
+#   4) espera "proxying from :PUERTO" en el log de websockify (esto si
+#      coincide, por eso /opt/websockify/run tiene que emitir esa linea)
+# Con template "basic" el script es nuestro y no hay nada que parchar.
+#
+# conn_params: la app escribe estos nombres en connection.yml y OOD los expone
+# como variables en view.html.erb. El template basic siempre agrega
+# host, port y password; 'websocket' y 'display' hay que declararlos.
+# Con 'websocket' presente, el dashboard ofrece el boton de noVNC.
+batch_connect:
+  template: "basic"
+  conn_params:
+    - websocket
+    - display
+    - resolution
+
+script:
+  native:
+    - "--partition"
+    - "{{ slurm_partition_name }}"
+    - "-N"
+    - "1"
+    - "--ntasks-per-node"
+    - "<%= bc_num_cores.to_i %>"
+    - "--mem"
+    - "<%= bc_memory.to_i %>M"
+    - "-t"
+    - "<%= bc_num_hours %>"

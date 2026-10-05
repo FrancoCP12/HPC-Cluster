@@ -1,0 +1,28 @@
+---
+cluster:
+  - "{{ slurm_cluster_name }}"
+
+form:
+  - bc_num_hours
+  - bc_num_cores
+  - bc_memory
+
+attributes:
+  bc_num_hours:
+    label: "Duración maxima"
+    value: "04:00:00"
+    widget: "text"
+  bc_num_cores:
+    label: "Cores"
+    value: "{{ interactive_num_cores_default }}"
+    min: "1"
+    max: "{{ interactive_num_cores_max }}"
+    step: "1"
+    widget: "number_field"
+  bc_memory:
+    label: "Memoria (MiB)"
+    value: "{{ interactive_memory_default_mb }}"
+    min: "256"
+    max: "{{ interactive_memory_max_mb }}"
+    step: "256"
+    widget: "number_field"
