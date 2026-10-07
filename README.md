@@ -14,7 +14,7 @@ Despliegue **100% automatizado** de un clúster [Slurm Workload Manager](https:/
 4. [Estructura del repositorio](#estructura-del-repositorio)
 5. [Configuración inicial](#configuración-inicial)
    - [Inventario](#1-inventario)
-   - [Variables y secretos (Ansible Vault)](#2-variables-y-secretos-ansible-vault)
+   - [Variables y secretos](#2-variables-y-secretos)
    - [Paquetes Slurm locales (.deb)](#3-paquetes-slurm-locales-deb)
 6. [Ejecución del playbook](#ejecución-del-playbook)
 7. [Qué hace cada play](#qué-hace-cada-play)
@@ -67,7 +67,7 @@ Despliegue **100% automatizado** de un clúster [Slurm Workload Manager](https:/
 - ✔️ **Autenticación Munge** con clave compartida distribuida automáticamente.
 - ✔️ **NFS compartido** (`/shared`) con mount persistente `_netdev` y sticky bit `1777`.
 - ✔️ **Apptainer** instalado y configurado con bind de `/shared` automático.
-- ✔️ **CERO hardcoding**: todas las credenciales/nombres externalizados en `group_vars/all.yml` (secreto con Ansible Vault) y `no_log` en las tareas sensibles.
+- ✔️ **CERO hardcoding**: todas las credenciales/nombres externalizados en `group_vars/all.yml` y `no_log` en las tareas sensibles.
 - ✔️ **Robustez operativa**: manejo de locks de APT (`fuser`, 300 s), espera activa de `slurmdbd` (`wait_for` 6819), persistencia de `/run/slurm` vía `systemd-tmpfiles`, y limpieza de estados DRAIN (`scontrol state=RESUME`).
 
 ---
@@ -86,7 +86,6 @@ Despliegue **100% automatizado** de un clúster [Slurm Workload Manager](https:/
 ```bash
 # Instalar la colección ansible.posix (una sola vez)
 ansible-galaxy collection install ansible.posix
-ansible-vault --version
 ```
 
 ### Nodos del clúster
@@ -107,7 +106,7 @@ El playbook no crea cuentas SSH ni IPs. Antes de ejecutar `playbook.yml`:
 |---|---|
 | Usuarios SSH | `master` (slurmmaster), `work` (worker1), `work2` (worker2) con `sudo`. |
 | IPs | `192.168.18.185` (slurmmaster/slurmdb/slurmod/slurmldap), `192.168.18.175` (worker1), `192.168.18.177` (worker2). |
-| Secrets | Gestionados con `ansible-vault` (`.vault_pass` fuera del repo). |
+| Secrets | En texto plano en `group_vars/all.yml` (ver sección 2). |
 
 ---
 
@@ -119,7 +118,7 @@ Slurm-Ansible/
 ├── inventory.ini            # Inventario: master / database / compute
 ├── playbook.yml             # Playbook principal (todo el despliegue)
 ├── group_vars/
-│   └── all.yml              # Variables del clúster + secretos (Vault)
+│   └── all.yml              # Variables del clúster + secretos
 ├── templates/
 │   ├── slurm.conf.j2        # Configuración principal de Slurm (multi-nodo)
 │   ├── slurmdbd.conf.j2     # Configuración de la base contable
@@ -159,22 +158,23 @@ ansible_become=true
 
 > ⚠️ Las contraseñas SSH embebidas aquí se pueden reemplazar por **llaves SSH** y/o `ansible-vault` para mayor seguridad. La variable `node_feature` alimenta el campo `Feature` de cada nodo en `slurm.conf`.
 
-### 2. Variables y secretos (Ansible Vault)
+### 2. Variables y secretos
 
-Crea los secretos de forma segura:
-
-```bash
-# Genera un valor cifrado para la contraseña de la BD
-ansible-vault encrypt_string 'Tu-Super-Clave-123' --name slurm_db_password
-```
-
-Copia el bloque generado en `group_vars/all.yml`:
+Las credenciales están en **texto plano** en `group_vars/all.yml`. No hay cifrado: no se usa Ansible Vault ni ningún `.vault_pass`.
 
 ```yaml
-slurm_db_password: !vault |
-          $ANSIBLE_VAULT;1.1;AES256
-          ...
+# group_vars/all.yml
+slurm_db_password: "..."
+ldap_admin_password: "..."
 ```
+
+Editá esos valores directamente y aplicá con un tag acotado para no tocar el resto:
+
+```bash
+ansible-playbook playbook.yml --tags ldap
+```
+
+> ⚠️ Esto implica que las contraseñas reales quedan en el historial de git. Si el remoto alguna vez fue público, o el repo se comparte, rotá las credenciales. Para un clúster de laboratorio con remoto privado es un compromiso razonable; para producción, `ansible-vault encrypt_string` sigue siendo la opción correcta y no requiere ningún cambio en el playbook.
 
 Variables disponibles (todas en `group_vars/all.yml`):
 
@@ -186,7 +186,7 @@ Variables disponibles (todas en `group_vars/all.yml`):
 | `slurm_uid` / `slurm_gid` | UID/GID unificados entre nodos | `1100` |
 | `slurm_db_host` | Host de la base (resuelto del grupo `[database]`) | automático |
 | `slurm_db_user` | Usuario MySQL de Slurm | `slurm` |
-| `slurm_db_password` | **Secreto** MySQL (Vault) | — |
+| `slurm_db_password` | Contraseña MySQL de Slurm | — |
 | `slurm_db_name` | Nombre de la base contable | `slurm_acct_db` |
 | `slurm_db_port` | Puerto MySQL | `3306` |
 | `slurmdbd_port` | Puerto de `slurmdbd` | `6819` |
@@ -222,11 +222,8 @@ ansible all -m ping
 # 2. Chequeo de sintaxis
 ansible-playbook --syntax-check playbook.yml
 
-# 3. Ejecución completa (con Vault)
+# 3. Ejecución completa
 ansible-playbook playbook.yml
-
-#   Si usaste ansible-vault:
-ansible-playbook playbook.yml --ask-vault-pass
 
 # 4. (Opcional) limitar el alcance
 ansible-playbook playbook.yml --limit compute
@@ -397,13 +394,13 @@ Con `detected_gpus > 0` se genera `gres.conf` (NVIDIA: `AutoDetect=nvml` con fal
 
 ## Seguridad
 
-- **Secretos en Vault**: la contraseña de MySQL nunca viaja en claro; usar `ansible-vault encrypt_string`.
+- **Secretos en texto plano**: `group_vars/all.yml` contiene contraseñas reales sin cifrar. Es una decisión consciente para este laboratorio; ver sección 2. El repo debe quedar en un remoto privado.
 - **`no_log: true`** en tareas que manejan credenciales (MySQL, `slurmdbd.conf`).
 - **`munge.key`** con permisos `0400` y distribuido solo entre nodos del clúster.
 - **`slurmdbd.conf`** con permisos `0600`.
 - **Firewall**: restringe 6817/6818/6819/3306/2049 a la subred del clúster.
 - **Sticky bit `1777`** en `/shared` para evitar sobrescrituras entre usuarios.
-- **No commitees** los siguientes archivos: `group_vars/all.yml` con secretos reales, claves SSH, `.deb` gigantes innecesarios, o el contenido de `paquetes-compilados/` si no lo necesitas.
+- **No commitees**: claves SSH, `.deb` gigantes innecesarios, o el contenido de `paquetes-compilados/` si no lo necesitas. (`group_vars/all.yml` sí se commitea con secretos en claro por decisión del proyecto.)
 
 ---
 

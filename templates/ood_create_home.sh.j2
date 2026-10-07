@@ -57,7 +57,16 @@ esac
 # --- 4. Padre setgid ---------------------------------------------------------
 # Los homes heredan el grupo y siguen siendo escribibles por el grupo aunque se
 # creen como root. Sin esto el home queda 755 y no lo puede escribir nadie mas.
-install -d -m "$ROOT_MODE" -o root -g "$SHARED_HOME_GROUP" "$SHARED_HOME_ROOT"
+#
+# Esto corre sobre el share montado por NFS desde el nodo OOD, asi que depende
+# de que /export/home se exporte con no_root_squash para ese cliente: con
+# root_squash el root remoto es "nobody" y el chmod falla con EPERM.
+#
+# El playbook ya deja este directorio con modo y grupo correctos desde el
+# servidor NFS, asi que un fallo aca no impide crear el home del usuario: se
+# avisa por stderr y se sigue. Abortar aqui dejaba al usuario sin home.
+install -d -m "$ROOT_MODE" -o root -g "$SHARED_HOME_GROUP" "$SHARED_HOME_ROOT" \
+  || echo "ood_create_home: aviso: no se pudo ajustar $SHARED_HOME_ROOT desde este host (revisar no_root_squash en el export NFS); el modo queda como lo dejo el servidor" >&2
 
 # --- 5. Crear o reparar el home ---------------------------------------------
 CHANGED=0

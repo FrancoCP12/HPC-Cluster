@@ -23,18 +23,18 @@ slurm_gid: 1100
 
 # ----- Base de datos contable (MySQL / SlurmDBD) -----
 # Host/IP derivados automáticamente del primer miembro del grupo [database].
-slurm_db_host: "{{ hostvars[groups['database'][0]]['ansible_facts']['hostname'] | default(groups['database'][0]) }}"
-slurm_db_ip: "{{ hostvars[groups['database'][0]]['ansible_facts']['default_ipv4']['address'] | default(hostvars[groups['database'][0]]['ansible_host']) }}"
+slurm_db_host: "{{ hostvars[groups['database'][0]]['ansible_hostname'] | default(groups['database'][0]) }}"
+slurm_db_ip: "{{ hostvars[groups['database'][0]]['ansible_host'] | default(hostvars[groups['database'][0]]['ansible_default_ipv4']['address']) }}"
 slurm_db_user: slurm
-slurm_db_password: !vault |
-          $ANSIBLE_VAULT;1.1;AES256
-          30336639313535356533356261333631633062393836383539313866626438643864346334653730
-          6437653564303166386130643337666131616334353932610a356662333630353237366238346464
-          39343832656333616266306539353031616465653865373239663832303838306237653761373161
-          3939343961393437630a363336326639363262383363376162396339376631626333343661346434
-          64396138316130316161613337303830313430333362353565656333396235616566
+slurm_db_password: "SlurmDB2026!"
 slurm_db_name: slurm_acct_db
 slurm_db_port: 3306
+# slurmdbd exige estos dos valores para accounting; sin ellos avisa
+# "Database settings not recommended values" y con carga real el registro de
+# eventos se traba. El buffer pool se calcula sobre la RAM del host [database],
+# no del actual, para que siga siendo valido si la base se mueve de topologia.
+mysql_innodb_buffer_pool_mb: "{{ ((hostvars[groups['database'][0]]['ansible_memtotal_mb'] | default(2048)) * 0.25) | int }}"
+mysql_innodb_lock_wait_timeout: 3600
 slurmdbd_port: 6819                     # Puerto del demonio SlurmDBD
 # slurmrestd NO puede correr como root, como SlurmUser ni con el grupo de
 # SlurmUser: aborta con "should not be run as the root user", "should not be run
@@ -52,6 +52,15 @@ node_exporter_user: prometheus
 node_exporter_group: prometheus
 node_exporter_textfile_dir: /var/lib/node_exporter
 node_exporter_args: "--collector.textfile.directory={{ node_exporter_textfile_dir }}"
+
+prometheus_port: 9090
+node_exporter_port: 9100
+
+# Prometheus queda en el master porque es el que scrapea al node_exporter y al
+# textfile collector con las metricas de Slurm. Grafana se instala en el nodo OOD
+# para quedar junto al Apache del portal, asi que el datasource tiene que
+# alcanzarlo por red en vez de por loopback.
+prometheus_host: "{{ hostvars[groups['master'][0]]['ansible_host'] | default(hostvars[groups['master'][0]]['ansible_default_ipv4']['address'] | default('127.0.0.1')) }}"
 
 # ----- Almacenamiento compartido (NFS) -----
 slurm_shared_dir: /shared
@@ -74,6 +83,20 @@ shared_home_root: /export/home
 # export a la red del clúster evita exponer los homes compartidos a cualquier
 # host de la LAN.
 nfs_export_networks: "192.168.18.0/24"
+
+# Clientes autorizados a gestionar los homes SIN squash. El nodo Open OnDemand
+# necesitaprivilegios root reales sobre el share: nginx_stage corre
+# ood_create_home desde exec_pre_hook como root y ese script hace install -d,
+# chown y chmod por cada usuario. Con root_squash el root remoto se mapea a
+# nobody y todo eso falla con EPERM ("chmod failed with error Operation not
+# permitted"), dejando los homes sin dueno correcto.
+#
+# El squash se levanta SOLO para el home y SOLO para el nodo OOD: /shared y el
+# resto de la red siguen con root_squash. Si OOD corre en el propio master se
+# filtra, porque ahi el root es local y no hay nada que chmodear a traves de NFS.
+nfs_home_admin_clients: >-
+  {{ (groups['ondemand'] | default([]) | map('extract', hostvars, 'ansible_host') | list)
+     | difference([hostvars[groups['master'][0]]['ansible_host'] | default(''), '']) }}
 
 # ----- Contenedores (Apptainer) -----
 apptainer_bind_mount: /shared           # Bind path automático en contenedores
@@ -118,37 +141,19 @@ ldap_uri: "ldaps://{{ ldap_server_ip }}:636"
 
 # Credenciales administrativas
 ldap_admin_dn: "cn=admin,dc=utn,dc=edu,dc=ar"
-ldap_admin_password: !vault |
-          $ANSIBLE_VAULT;1.1;AES256
-          64663030653164663662636531323761363031353763663963356630623738316234316434323632
-          3937626666313764656430366537643834396138306134650a613534643036343335343132303830
-          64643939393163626266396537316634613338613737363365396134633030356434323439373466
-          6232663561633564390a656562626635663232623363386165313430353032376336613962616235
-          32326133396435663431336536376438636562306539393230373161383933656235
+ldap_admin_password: "ClusterAdminPassword2026!"
 
 # Cuenta de lectura para SSSD (Service Account)
 ldap_default_bind_dn: "cn=admin,dc=utn,dc=edu,dc=ar"
-ldap_default_authtok: !vault |
-          $ANSIBLE_VAULT;1.1;AES256
-          30346632666531343337623130353934383139663238633465323262393337656262353162663264
-          3264353436653734366535643966663361623635383035650a393934336363316666336638616137
-          35623865623634343232663335333261373236653233373163663565323931653833383838376161
-          3230336637623432370a636434653861386539303264373861326236393431346431623062646165
-          62323730636466386338643333363932626539616131346364353438633263333661
+ldap_default_authtok: "ClusterAdminPassword2026!"
 ldap_tls_reqcert: "never"
 
 # Usuario de prueba que se crea en ou=People para validar la autenticacion
-# contra ColdFront y Open OnDemand. El playbook NO guarda el hash en el LDIF:
+# contra Open OnDemand. El playbook NO guarda el hash en el LDIF:
 # lo genera con slappasswd en tiempo de ejecucion a partir de este valor, asi
 # que el texto claro nunca se escribe en el arbol LDAP.
 ldap_test_user: "admin"
-ldap_test_user_password: !vault |
-          $ANSIBLE_VAULT;1.1;AES256
-          32663362653364393032333535663032376637393835363862383766633135343732396663323530
-          3061366562323265653262316362396665636534623037350a613261303562343533363334646633
-          63623336613638663538383361663536343736346133383734656238303637346166346665663836
-          3365366661333431310a306535653639623866343434616533326265313430306235643235613964
-          30323466313463643732346261616166656331633836666435353631616364623032
+ldap_test_user_password: "admin1"
 # Deben coincidir con uidNumber/gidNumber del LDIF de arriba.
 ldap_test_user_uid: 2004
 ldap_test_user_gid: 2000
@@ -163,13 +168,7 @@ ldap_test_user_home: "{{ shared_home_root }}/{{ ldap_test_user }}"
 # entradas comparten uidNumber, getent devuelve el mismo uid para las dos y el
 # home de una queda propiedad de la otra.
 ldap_second_user: "alumno1"
-ldap_second_user_password: !vault |
-          $ANSIBLE_VAULT;1.1;AES256
-          36346664356433313334626633366166643865633438333932326333643334336131336133303063
-          3662356666336464343539383836393562333066386233360a666338666565343734303165643464
-          63366636366365363836653331343364356130626561363832323863303130646466313464366539
-          3733353364343464630a303433633066333337663361353532373638356435643033333834353365
-          32346665323831323864353262376537393036666233633933333163393730373962
+ldap_second_user_password: "alumno1"
 ldap_second_user_uid: 2002
 ldap_second_user_gid: 2000
 ldap_second_user_home: "{{ shared_home_root }}/{{ ldap_second_user }}"
@@ -209,27 +208,30 @@ interactive_memory_max_mb: 1024
 # node_uri / rnode_uri en ood_portal.yml los botones "Connect" de Jupyter y
 # VS Code no tienen a donde apuntar.
 #
+# El regex se arma SOLO en el play 9 a partir de los ansible_hostname reales de
+# los nodos de 'compute', asi que no hay mas que acordarse de actualizarlo al
+# agregar un nodo.
+#
 # Se mantiene ESTRECHA a proposito: host_regex habilita proxy hacia cualquier
 # host que coincida, asi que un comodin abierto (p.ej. '[\w.-]+') convierte al
-# portal OOD en un proxy abierto de la red interna (SSRF).
-# SIN anchors ^ $: OOD embebe el valor tal cual dentro de su propio patron,
-# "LocationMatch \"^/node/(?<host>#{host_regex})/(?<port>\d+)\"". Con los anchors
-# el grupo queda (?<host>^(work2|worker2)$) y el ^ interior exige estar en la
-# posicion 0 del subject, que ya se-consumio con "/node/", asi que la regex no
-# matchea nunca y TODO /node y /rnode devuelven 404. El proxy queda con el
-# LocationMatch correcto pero sin rutear: los botones "Connect" de Jupyter y
-# VS Code llevan a un 404 aunque la sesion este corriendo.
+# portal OOD en un proxy abierto de la red interna (SSRF). La lista de nombres
+# explicitos es lo que lo mantiene acotado.
 #
 # Los hostnames NO son los del inventory: OOD proxea al host que Slurm reporta
-# (NodeName) y al que devuelve 'hostname' dentro del job. Acá NodeName es
-# work / work2 (templates/slurm.conf.j2) mientras que el compute group del
-# inventory se llama worker1 / worker2.
+# (NodeName) y al que devuelve 'hostname' dentro del job. NodeName sale de
+# ansible_hostname del nodo (templates/slurm.conf.j2), mientras que el compute
+# group del inventory se llama worker1 / worker2. Ejemplo real del deadlock que
+# kostaba un deploy por semana: NodeName es 'workf', no 'work' ni 'work2'.
 #
-# Estuvo en '(work2|worker2)': incluia 'work2' pero NO 'work'. Toda sesion que
-# caia en el primer nodo moria con 404 "Not Found" al pulsar el boton, aunque
-# el servidor estuviera escuchando. La lista tiene que cubrir TODOS los
-# NodeName de compute; al agregar un nodo hay que sumarlo aca.
-ood_proxy_host_regex: '(work|work2)'
+# Estuvo en '(work2|worker2)': incluia 'work2' pero NO 'work'. Luego en
+# '(work|work2)': seguia sin cubriendo 'workf'. Toda sesion que caia en el
+# primer nodo moria con 404 "Not Found" al pulsar el boton, aunque el servidor
+# estuviera escuchando. La lista tiene que cubrir TODOS los NodeName de
+# compute.
+#
+# Nombres ADICIONALES a aceptar, para casos donde Slurm reporte un nombre
+# distinto al del sistema (alias, FQDN). Lista vacia en la practica.
+ood_proxy_host_regex_extra: []
 
 # Grafana se publica como subpath del portal, no en un puerto propio.
 grafana_sub_path: /grafana
@@ -361,191 +363,6 @@ nfs_home_opts: "{{ nfs_common_opts }}{{ ',context=\"system_u:object_r:user_home_
 # Open OnDemand FQDN & TLS
 ood_server_name: "ondemand.utn.edu.ar"
 
-
-# ============================================================================
-# ColdFront (contenedor Podman) — datos de conexión al MySQL del Master
-# ============================================================================
-coldfront_db_name: "coldfront"
-coldfront_db_user: "coldfront_user"
-coldfront_db_pass: !vault |
-          $ANSIBLE_VAULT;1.1;AES256
-          35626439643363626230323039633062343438336266616362326465363666323838366231643662
-          6634336631346435376333663062373165356430623232300a366535323265616437656661373733
-          31626466376335313838623835363461303337633836373164353161313431383863366633656261
-          6436333135646535390a306631613138313165383739386230626636313363366332333838393764
-          30363430616439383666376634323131383636393038316366386266396363346161
-coldfront_secret_key: !vault |
-          $ANSIBLE_VAULT;1.1;AES256
-          63323734363038623862396333396236613361666439663064396132626130633132386661646266
-          3530343663356237363834386565383662663166396236630a623663646363396430303565663664
-          64656134613838653038623836313531643238316334323331313934653737356263386266343238
-          3731373166303335350a376265333438633635376532383432353064393764363463313136656464
-          62653632616166363130636532653237306339646238653930343266316365643538313636623263
-          3033383164383831393964313438336565313233343334393962
-coldfront_admin_user: "admin"
-coldfront_admin_email: "admin@utn.edu.ar"
-coldfront_admin_pass: !vault |
-          $ANSIBLE_VAULT;1.1;AES256
-          61313539666663393736336531633334616631306165303839323738626537353339633530383138
-          6237393762373039363363363136393231303636346363330a663334386532343636613166356332
-          65326631656333633466343439323434323866366233656339396138636561643131393235343438
-          6233613634353064330a656262383034643934373430363137616438363639653135633833343630
-          66643931356135393734623965633237326535306436386231306536643232646464
-
-# Imagen oficial. Se fija una etiqueta exacta (nunca 'latest') para que el
-# despliegue sea reproducible y el hash de configuración del contenedor sea
-# estable entre ejecuciones (requisito de idempotencia).
-coldfront_image: "docker.io/ubccr/coldfront:1.1.8"
-coldfront_container_name: "coldfront-app"
-
-# Puerto interno del contenedor (gunicorn en :8000) y puerto de publicación
-# en Apache. El binding del contenedor es sólo loopback.
-coldfront_internal_port: 8001
-coldfront_port: "8000"
-
-# Tablas clave que 'manage.py migrate' debe haber creado en el MySQL del
-# Master. Sirven como guard: si el contenedor cayó en el fallback SQLite,
-# ninguna existirá en el Master y el playbook aborta con un mensaje claro.
-# 'project_status_choice' es la que consulta initial_setup para sembrar.
-# Tablas que debe tener el esquema de ColdFront 1.1.8. Django las crea con el
-# prefijo del app, así que los nombres NO son `project` ni `resource` a secas.
-coldfront_required_tables:
-  - auth_user
-  - auth_group
-  - auth_user_groups
-  - django_migrations
-  - django_content_type
-  - project_project
-  - project_projectstatuschoice
-  - project_projectuser
-  - project_projectusermessage
-  - resource_resource
-  - resource_resourcetype
-  - resource_resourceattributetype
-  - allocation_allocation
-  - allocation_allocationstatuschoice
-  - allocation_allocationuser
-  - field_of_science_fieldofscience
-  - grant_grant
-  - user_userprofile
-
-# ============================================================================
-# Open XDMoD 11 (RPM nativo + MariaDB local)
-# ============================================================================
-xdmod_version: "11.0.4"
-xdmod_rpm_url: "https://github.com/ubccr/xdmod/releases/download/v{{ xdmod_version }}-2/xdmod-{{ xdmod_version }}-2.el8.noarch.rpm"
-# Copia local del RPM, usada para restaurar /etc/xdmod si el RPM declara
-# entradas ausentes (no se reinstala el paquete en cada corrida).
-xdmod_rpm_local: "/opt/xdmod-pkg/xdmod-{{ xdmod_version }}-2.el8.noarch.rpm"
-xdmod_port: "8085"
-
-# Nombre del recurso declarado en resources.json. Debe coincidir con el
-# SlurmClusterName registrado en SlurmDBD y con el argumento -r del shredder.
-xdmod_resource_name: "{{ slurm_cluster_name }}"
-
-# Fecha de inicio del recurso en resource_specs.json (formato YYYY-MM-DD).
-# XDMoD la usa para las series temporales del data warehouse.
-xdmod_resource_start_date: "2000-01-01"
-
-# Especificaciones del recurso para resource_specs.json. Son informativas para
-# el Metric Explorer (nodos, cores, GPUs y cores por nodo).
-xdmod_cpu_node_count: 4
-xdmod_cpu_processor_count: 64
-xdmod_cpu_ppn: 16
-xdmod_gpu_node_count: 0
-xdmod_gpu_processor_count: 0
-xdmod_gpu_ppn: 0
-
-# Credenciales root de MariaDB local (data warehouse de XDMoD).
-xdmod_local_root_user: "root"
-xdmod_local_root_pass: "XdmodLocalRoot2026!"
-
-# Usuario de aplicación sobre las bases locales de XDMoD.
-xdmod_local_db_user: "xdmod"
-xdmod_local_db_pass: "XdmodLocalApp2026!"
-
-# Usuario de solo lectura sobre slurm_acct_db en el Master, para las variantes
-# de ingesta que consultan el data warehouse de Slurm directamente.
-xdmod_slurm_remote_user: "xdmod_slurm"
-xdmod_slurm_remote_pass: "SlurmXdm0d2026!"
-
-# Tablas que SlurmDBD crea en slurm_acct_db. Sólo las específicas del cluster
-# llevan el prefijo; las compartidas entre clusters (res, user, qos, tres, txn)
-# van sin prefijo.
-slurm_table_prefix: "{{ slurm_cluster_name | lower }}"
-slurm_required_tables:
-  - "{{ slurm_table_prefix }}_job_table"
-  - "{{ slurm_table_prefix }}_step_table"
-  - "{{ slurm_table_prefix }}_assoc_table"
-  - "{{ slurm_table_prefix }}_suspend_table"
-  - "{{ slurm_table_prefix }}_usage_day_table"
-  - "{{ slurm_table_prefix }}_event_table"
-  - "{{ slurm_table_prefix }}_qos_usage_day_table"
-  - "{{ slurm_table_prefix }}_wckey_table"
-  - res_table
-  - user_table
-  - qos_table
-  - tres_table
-
-# Bases de datos reales que Open XDMoD 11 necesita, en el mismo orden que usa
-# el asistente oficial (OpenXdmod\Setup\DatabaseSetup::handle()).
-#
-#   mod_logger      obligatoria: endpoint 'logger' del ETL.
-#   modw_filters    el ETL no crea tablas aquí, pero DB\FilterListBuilder sí
-#                   hace CREATE TABLE al vuelo sobre este esquema (listas de
-#                   filtros del Metric Explorer). Si el esquema no existe, la
-#                   UI degrada con MissingFilterListTableException (42S02).
-#   mod_shredder    también aloja las tablas de staging del pipeline
-#                   'staging-bootstrap' (endpoint schema: mod_shredder).
-#
-# No existe 'mod_user_metrics' en la versión 11.
-xdmod_databases:
-  - moddb
-  - modw
-  - modw_aggregates
-  - modw_filters
-  - mod_shredder
-  - mod_hpcdb
-  - mod_logger
-
-# Esquemas cuyo número de tablas se audita al terminar el bootstrap. Son los
-# que los 8 pipelines de bootstrap más TimePeriodGenerator deben poblar.
-xdmod_schema_databases:
-  - moddb
-  - modw
-  - mod_shredder
-  - mod_hpcdb
-  - mod_logger
-
-# Mínimo de tablas por esquema tras el bootstrap. Estos valores están MEDIDOS
-# sobre un bootstrap real de xdmod-11.0.4-2, no derivados de la documentación:
-#
-#   moddb 49, modw 38, mod_shredder 20, mod_hpcdb 22, mod_logger 3
-#
-# Se usan los valores exactos y no una cota redondeada a la baja porque un
-# mínimo flojo (por ejemplo modw: 6) daba por bueno un modw casi vacío, que es
-# justamente el estado roto que había que detectar.
-#
-# Nota: en 11.0.4-2 el bootstrap NO crea modw_aggregates ni modw_filters, y
-# ningún esquema queda con tablas de filter. Los filtros los crea
-# DB\FilterListBuilder bajo demanda cuando un usuario guarda uno, así que no
-# corresponde exigirlos en el guard.
-# Reconstruir los esquemas de XDMoD desde cero. Es destructivo: borra
-# moddb, modw, mod_shredder, mod_hpcdb y mod_logger. Sólo hace falta cuando un
-# bootstrap quedó interrumpido y dejó el esquema a medias; una corrida normal
-# nunca lo activa.
-xdmod_force_rebuild: false
-
-# Minimos verificados con un bootstrap LIMPIO de xdmod-11.0.4-2 (los 8
-# pipelines de DatabaseSetup + TimePeriod). Los valores anteriores estaban
-# medidos sobre un esquema ya contaminado por intentos manuales fallidos, y
-# por eso exigian de mas (moddb daba 49 en vez de 35).
-xdmod_expected_tables:
-  moddb: 35
-  modw: 38
-  mod_shredder: 20
-  mod_hpcdb: 22
-  mod_logger: 3
 
 #ood_ssl_key_path: "/etc/pki/tls/private/ood.key"
 #ood_ssl_cert_path: "/etc/pki/tls/certs/ood.crt"

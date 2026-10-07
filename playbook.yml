@@ -11,15 +11,6 @@
   become: true
   gather_facts: true
   tasks:
-    - name: Garantizar sudo sin contraseña prioritario para el operador Ansible
-      ansible.builtin.copy:
-        dest: "/etc/sudoers.d/99-ansible-operator"
-        content: "{{ ansible_user | default(ansible_env.USER) }} ALL=(ALL) NOPASSWD:ALL\n"
-        owner: root
-        group: root
-        mode: '0440'
-        validate: '/usr/sbin/visudo -cf %s'
-
     - name: Deshabilitar actualizaciones desatendidas para evitar bloqueos de apt
       ansible.builtin.systemd:
         name: "{{ item }}"
@@ -30,6 +21,54 @@
         - apt-daily.timer
         - apt-daily-upgrade.timer
         - unattended-upgrades
+      failed_when: false
+
+    # --- Desmontar el portal web viejo -------------------------------------
+    # sync_hpc_groups sincronizaba grupos de un portal HPC que ya no esta en el
+    # repo. Los archivos se habian borrado del repositorio pero quedaron vivos
+    # en los nodos de una instalacion anterior, y el timer seguia arrancando un
+    # script que ya no existe.
+    #
+    # Primero se deshabilita y para la unit: si se borran los archivos sin
+    # detener el timer, systemd lo reinicia en el siguiente tick y falla.
+    #
+    # Sin masked: a proposito. Enmascarar crea un symlink a /dev/null en
+    # /etc/systemd/system/<nombre>, que es exactamente la ruta que borra la
+    # tarea de abajo: las dos cosas se contradicen y el mask se lleva por
+    # delante. El borrado ya impide que arrancen.
+    - name: Parar y deshabilitar el timer de sincronizacion de grupos del portal
+      ansible.builtin.systemd:
+        name: sync_hpc_groups.timer
+        state: stopped
+        enabled: false
+      failed_when: false
+
+    - name: Parar y deshabilitar la unidad de sincronizacion de grupos
+      ansible.builtin.systemd:
+        name: sync_hpc_groups.service
+        state: stopped
+        enabled: false
+      failed_when: false
+
+    - name: Eliminar los artefactos del portal web anterior
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /usr/local/bin/sync_hpc_groups.py
+        - /etc/systemd/system/sync_hpc_groups.service
+        - /etc/systemd/system/sync_hpc_groups.timer
+        - /etc/cron.d/sync_hpc_groups
+
+    - name: Limpiar el estado de systemd de las unidades eliminadas
+      # Sin esto quedan como "not-found" cargadas en memoria y un
+      # "systemctl daemon-reload" de otro paquete las muestra en el listado.
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: reset-failed
+      loop:
+        - sync_hpc_groups.service
+        - sync_hpc_groups.timer
       failed_when: false
 
 # ----------------------------------------------------------------------------
@@ -251,15 +290,6 @@
         - "'Already exists' not in second_user_out.stderr"
 
     - name: Crear LDIF que corrige uidNumber, gidNumber, homeDirectory y userPassword
-      # ldapadd tolera "Already exists", asi que una entrada creada a mano con un
-      # uidNumber repetido NUNCA se corrige sola: getent sigue devolviendo el mismo
-      # uid para los dos usuarios y el home de uno queda propiedad del otro. Por eso
-      # el uid se impone con 'replace', que es idempotente y pisa el valor previo.
-      #
-      # userPassword va por el mismo motivo y es lo que rompe el login: si la entrada
-      # se creo sin hash (o con un hash viejo), ldapadd la deja pasar por el
-      # "Already exists" y el bind falla con 'Invalid credentials (49)', que Apache
-      # reporta como 401 en /pun y /grafana aunque LDAP este perfecto.
       ansible.builtin.copy:
         dest: /tmp/fix_uids.ldif
         owner: root
@@ -303,9 +333,6 @@
       notify: Reiniciar slapd
 
     - name: Verificar que los dos usuarios ya no comparten uidNumber
-      # Guard explicito: si los uids siguen duplicados, el home del segundo
-      # usuario se va a crear con el uid del primero y el problema vuelve en
-      # forma de permisos ilegibles, mucho mas dificil de detectar.
       ansible.builtin.command: >
         ldapsearch -x -D "{{ ldap_admin_dn }}" -w "{{ ldap_admin_password }}" -H ldapi:///
         -b "{{ ldap_user_search_base }}" "(objectClass=posixAccount)" uid uidNumber
@@ -323,6 +350,57 @@
       ansible.builtin.systemd:
         name: slapd
         state: restarted
+
+# ----------------------------------------------------------------------------
+# 1.0. Munge: la clave se genera en el MAESTRO y se reparte al resto
+# ----------------------------------------------------------------------------
+# Esta tarea vive en su propio play y NO dentro del play "1." a propósito.
+# El play "1." corre `hosts: all` con `serial: 1`, o sea de a un host por
+# lote. Con `delegate_to: master` + `run_once: true`, la orden de ejecución
+# queda atado al inventario: el paquete `munge` se instalaba solo en el host
+# del lote actual, mientras el comando delegado corría contra el master, que
+# todavia no habia pasado por el `apt`. Resultado: `create-munge-key: not
+# found` si el master no es el primer host.
+#
+# Ademas `run_once` NO corre una sola vez por play cuando hay `serial`: corre
+# una vez por lote (verificado). Por eso la clave se genera aqui, en un play
+# propio contra `hosts: master`, y se expone con `set_fact` para que el
+# play "1." la distribuya sin depender del orden de los lotes.
+- name: "1.0. Generar munge.key en el nodo maestro"
+  hosts: master
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Instalar munge en el nodo maestro
+      ansible.builtin.apt:
+        name:
+          - munge
+          - libmunge-dev
+        state: present
+        update_cache: true
+
+    - name: Crear /etc/munge con permisos correctos
+      ansible.builtin.file:
+        path: /etc/munge
+        state: directory
+        owner: munge
+        group: munge
+        mode: '0755'
+
+    - name: Generar munge.key en el maestro
+      ansible.builtin.command: create-munge-key -f
+      args:
+        creates: /etc/munge/munge.key
+
+    - name: Leer la munge.key del maestro para distribuirla
+      ansible.builtin.slurp:
+        src: /etc/munge/munge.key
+      register: munge_key_slurp
+
+    - name: Publicar la munge.key como hostvar del maestro
+      ansible.builtin.set_fact:
+        munge_key_b64: "{{ munge_key_slurp['content'] }}"
+      changed_when: false
 
 # ----------------------------------------------------------------------------
 # 1. Infraestructura Base: Sudo, Tiempo, Munge, SSSD y Clientes Slurm
@@ -358,12 +436,20 @@
       changed_when: false
       failed_when: false
 
+
     - name: Garantizar resolución estática en /etc/hosts para todos los nodos
       ansible.builtin.lineinfile:
         path: /etc/hosts
-        line: "{{ hostvars[item]['ansible_host'] | default(hostvars[item]['ansible_facts']['default_ipv4']['address'] | default(item)) }} {{ hostvars[item]['ansible_facts']['hostname'] | default(item) }}"
+        regexp: '^\s*\S+\s+{{ item | regex_escape }}(\s|$)'
+        line: >-
+          {{ hostvars[item]['ansible_host'] | default(hostvars[item]['ansible_default_ipv4']['address'] | default(item)) }}
+          {{ item }}
+          {% if hostvars[item]['ansible_user'] is defined and hostvars[item]['ansible_user'] != item -%}
+          {{ hostvars[item]['ansible_user'] }}
+          {%- endif %}
         state: present
       loop: "{{ groups['all'] }}"
+
 
     - name: Asegurar grupo del sistema para Slurm
       ansible.builtin.group:
@@ -392,23 +478,19 @@
       ansible.builtin.command: systemd-tmpfiles --create /etc/tmpfiles.d/slurm.conf
       changed_when: false
 
-    - name: Generar munge.key únicamente en el nodo maestro
-      ansible.builtin.command: create-munge-key -f
-      args:
-        creates: /etc/munge/munge.key
-      delegate_to: "{{ groups['master'][0] }}"
-      run_once: true
-
-    - name: Leer munge.key del maestro
-      ansible.builtin.slurp:
-        src: /etc/munge/munge.key
-      delegate_to: "{{ groups['master'][0] }}"
-      run_once: true
-      register: munge_key_master
+    - name: Verificar que la munge.key del maestro esté disponible
+      ansible.builtin.assert:
+        that:
+          - hostvars[groups['master'][0]]['munge_key_b64'] is defined
+        fail_msg: >-
+          No se encontro la munge.key del maestro. El play "1.0." (hosts: master)
+          debe ejecutarse antes que este. Si usas --limit, incluí al master en el
+          alcance o corré el playbook completo.
+        success_msg: munge.key del maestro disponible
 
     - name: Distribuir munge.key con permisos 0400 en todos los nodos
       ansible.builtin.copy:
-        content: "{{ munge_key_master['content'] | b64decode }}"
+        content: "{{ hostvars[groups['master'][0]]['munge_key_b64'] | b64decode }}"
         dest: /etc/munge/munge.key
         owner: munge
         group: munge
@@ -505,8 +587,34 @@
         line: 'bind-address = 0.0.0.0'
       notify: Reiniciar mysql
 
+    - name: Ajustar MySQL a los valores que exige Slurm para accounting
+      # slurmdbd avisa "Database settings not recommended values:
+      # innodb_buffer_pool_size innodb_lock_wait_timeout". Con el buffer pool
+      # chico y un lock wait corto, el registro de eventos se traba en cuanto
+      # entra carga real. Se escribe antes del flush_handlers de abajo para que
+      # el unico reinicio de MySQL aplique el bind-address y esto juntos.
+      ansible.builtin.copy:
+        dest: /etc/mysql/mysql.conf.d/zz-slurm.cnf
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          [mysqld]
+          innodb_buffer_pool_size = {{ mysql_innodb_buffer_pool_mb | int }}M
+          innodb_lock_wait_timeout = {{ mysql_innodb_lock_wait_timeout | int }}
+      notify: Reiniciar mysql
+
     - name: Forzar flush para aplicar bind-address
       ansible.builtin.meta: flush_handlers
+
+    # El flush de arriba reinicia MySQL. Las tareas siguientes entran por el
+    # socket unix, asi que hay que esperar a que vuelva a aceptar conexiones.
+    - name: Esperar a que MySQL vuelva a aceptar conexiones
+      ansible.builtin.wait_for:
+        port: "{{ slurm_db_port }}"
+        host: 127.0.0.1
+        state: started
+        timeout: 60
 
     - name: Crear base de datos para SlurmDBD
       ansible.builtin.command: >
@@ -577,6 +685,18 @@
         enabled: true
         daemon_reload: true
 
+    # slurmdbd aborta con "This host not configured to run SlurmDBD" si DbdHost
+    # no coincide con el hostname real, y con eso slurmctld se queda sin
+    # ClusterID y el endpoint /nodes del slurmrestd responde 504 mucho despues,
+    # sin relacion apparent con la causa. Se espera el puerto aca para que el
+    # play 2 falle en el sitio correcto.
+    - name: Esperar a que slurmdbd abra el puerto de accounting
+      ansible.builtin.wait_for:
+        port: "{{ slurmdbd_port }}"
+        host: 127.0.0.1
+        state: started
+        timeout: 60
+
   handlers:
     - name: Reiniciar mysql
       ansible.builtin.systemd:
@@ -599,6 +719,7 @@
 # ----------------------------------------------------------------------------
 - name: "3. Aprovisionar Controlador Maestro (slurmctld)"
   hosts: master
+  serial: 1
   become: true
   tasks:
     - name: Asegurar directorio temporal para deb de slurmctld
@@ -640,6 +761,52 @@
         - /run/slurm
         - /var/spool/slurmctld
 
+    # /etc/slurm/slurm.conf tiene que existir ANTES de arrancar slurmctld ni
+    # slurmrestd. Las dos units del paquete arrancan con
+    #   ConditionPathExists=/etc/slurm/slurm.conf
+    # y si el archivo no esta, systemd marca la unit como "skipped" SIN error:
+    #   Active: inactive (dead)
+    #   Condition: start condition unmet
+    # Por eso slurmrestd nunca alcanzaba a correr, pgrep no lo encontraba y
+    # la comprobacion de usuario sin privilegios fallaba con rc=1.
+    # Esta version es provisional: todavia no conoce detected_gpus de los
+    # workers (se detecta en el play 5); el play 7 reescribe el definitivo.
+    - name: Desplegar slurm.conf provisional en el master
+      ansible.builtin.template:
+        src: templates/slurm.conf.j2
+        dest: /etc/slurm/slurm.conf
+        owner: "{{ slurm_user }}"
+        group: "{{ slurm_group }}"
+        mode: '0644'
+      notify: Reiniciar slurmctld
+
+    # slurmctld no lo arrancaba ninguna tarea del playbook. Sin el, el master
+    # queda sin controlador y el "scontrol reconfigure" del play 7 no tiene
+    # contra que actuar.
+    - name: Habilitar y arrancar slurmctld
+      ansible.builtin.systemd:
+        name: slurmctld
+        state: started
+        enabled: true
+
+    # Type=notify marca la unit activa al recibir READY=1, pero eso NO alcanza:
+    # un slurmctld puede quedar "active" para systemd y DOWN para Slurm si no
+    # logra registrarse en slurmdbd (sin ClusterID). systemctl is-activeeria
+    # "active" en ese caso. scontrol ping si distingue: sale con codigo 1 y
+    # "Slurmctld(primary) at masterf is DOWN". Se usa ese como señal real.
+    - name: Esperar a que slurmctld responda el ping
+      ansible.builtin.command:
+        argv:
+          - timeout
+          - "30"
+          - scontrol
+          - ping
+      register: slurmctld_ping
+      changed_when: false
+      retries: 15
+      delay: 4
+      until: slurmctld_ping.rc == 0
+
     # --- slurmrestd: API REST de Slurm para el exporter de Prometheus --------
     # El build de Slurm 24.11.7 de packages/ NO trae endpoint OpenMetrics: en el
     # arbol de fuentes no hay ninguna cadena "metrics" bajo src/slurmrestd/, asi
@@ -680,7 +847,6 @@
       register: slurmrestd_deb
 
     - name: Dependencia de libhttp-parser para slurmrestd
-      # slurmrestd linka contra libhttp-parser2.9; sin esto no arranca.
       ansible.builtin.apt:
         name: libhttp-parser2.9
         state: present
@@ -691,8 +857,12 @@
         state: present
       when: slurmrestd_deb.files | length > 0
 
+    - name: Crear el grupo de sistema para slurmrestd
+      ansible.builtin.group:
+        name: "{{ slurmrestd_group }}"
+        system: true
+
     - name: Crear el usuario de sistema para slurmrestd
-      # Ver el punto 3 del comentario de arriba.
       ansible.builtin.user:
         name: "{{ slurmrestd_user }}"
         group: "{{ slurmrestd_group }}"
@@ -700,9 +870,6 @@
         create_home: false
         shell: /usr/sbin/nologin
         comment: "Slurm REST daemon"
-        # append: false hace que la lista sea EXCLUSIVA. Sin esto, si el usuario
-        # quedo antes dentro del grupo slurm, sigue como suplementario y
-        # slurmrestd sigue abortando aunque el Group= de la unit ya sea correcto.
         groups: []
         append: false
 
@@ -771,6 +938,22 @@
       # terminara bien. Ademas, si el play fallara antes, el servicio
       # quedaria sin reiniciar y el next run arrancaria con un config fantasma.
       ansible.builtin.meta: flush_handlers
+
+    # El flush de arriba reinicia slurmctld si el slurm.conf cambio. slurmrestd
+    # habla con el controlador, asi que sin esta espera la comprobacion de la
+    # API correria contra un slurmctld a medio reiniciar.
+    - name: Reesperar a slurmctld tras el reinicio por handler
+      ansible.builtin.command:
+        argv:
+          - timeout
+          - "30"
+          - scontrol
+          - ping
+      register: slurmctld_ping_again
+      changed_when: false
+      retries: 15
+      delay: 4
+      until: slurmctld_ping_again.rc == 0
 
     - name: Recargar systemd para el drop-in de slurmrestd
       ansible.builtin.systemd:
@@ -842,11 +1025,17 @@
         mode: '0755'
 
     - name: Crear el directorio de textfile de node_exporter
+      # Sin owner "{{ node_exporter_user }}" a proposito: ese usuario lo crea el
+      # paquete prometheus-node-exporter, que se instala en el play 9, mas
+      # adelante. Ponerlo aca hace fallar el chown con "failed to look up user
+      # prometheus". El exporter de Slurm corre como root (su unit no tiene
+      # User=) asi que escribe igual, y node_exporter solo necesita leer los
+      # .prom. El play 9 le asigna el dueno cuando el usuario ya existe.
       ansible.builtin.file:
         path: "{{ node_exporter_textfile_dir }}"
         state: directory
-        owner: "{{ node_exporter_user }}"
-        group: "{{ node_exporter_group }}"
+        owner: root
+        group: root
         mode: '0755'
 
     - name: Crear el timer del exporter de Slurm
@@ -913,6 +1102,12 @@
   handlers:
     # Los handlers NO se heredan entre plays, asi que cada uno va en el play de
     # la tarea que lo notifica.
+    - name: Reiniciar slurmctld
+      ansible.builtin.systemd:
+        name: slurmctld
+        state: restarted
+        daemon_reload: true
+
     - name: Reiniciar slurmrestd
       ansible.builtin.systemd:
         name: slurmrestd
@@ -987,6 +1182,22 @@
             content: |
               {{ slurm_shared_dir }} {{ nfs_export_networks }}(rw,sync,no_subtree_check)
               {{ shared_home_root }} {{ nfs_export_networks }}(rw,sync,no_subtree_check)
+              {% for c in nfs_home_admin_clients %}
+              {{ shared_home_root }} {{ c }}(rw,sync,no_subtree_check,no_root_squash)
+              {% endfor %}
+
+        - name: Crear la raiz de homes con setgid y grupo de referencia
+          # La crea el SERVIDOR, donde root no esta squasheado, para que el
+          # setgid quede garantizado aunque el nodo OOD todavia no haya montado
+          # el share. Los homes heredan asi el grupo y siguen siendo
+          # escribibles por el grupo aunque los cree root.
+          ansible.builtin.file:
+            path: "{{ shared_home_root }}"
+            state: directory
+            owner: root
+            group: "{{ home_group }}"
+            mode: "{{ home_root_mode }}"
+
 
         - name: Vaciar tabla de exportaciones del kernel
           # exportfs -ra SOLO agrega entradas: las cargadas a mano con
@@ -1156,6 +1367,7 @@
         /tmp/slurm_debs/slurm-smd-slurmd_*.deb
       register: apt_slurmd
       changed_when: "'Setting up' in apt_slurmd.stdout"
+
 
     # --- Aplicaciones Interactivas para Open OnDemand ---
     - name: Instalar Jupyter Notebook y dependencias de Python
@@ -1335,10 +1547,40 @@
         seconds: 3
 
     - name: Limpiar posibles estados DRAIN y reanudar nodos
-      ansible.builtin.shell: 'scontrol update nodename={{ hostvars[item]["ansible_facts"]["hostname"] | default(item) }} state=RESUME reason=""'
+      ansible.builtin.shell: 'scontrol update nodename={{ item }} state=RESUME reason=""'
       loop: "{{ groups['compute'] }}"
       changed_when: false
       failed_when: false
+
+    # La tarea anterior tiene failed_when: false a proposito (un nodo en DRAIN
+    # no deberia tumbar el play), pero eso se traga tambien el caso real de un
+    # nodo que el controlador no conoce. Se verifica aparte, y en vez de un
+    # error opaco imprime el estado de cada nodo.
+    #
+    # OJO con el patron: Slurm 24.x emite "State=IDLE", no "NodeState=IDLE".
+    # Buscar solo NodeState hace que un nodo perfectamente registrado se
+    # reporte como "NO REGISTRADO". Por eso el patron acepta ambas formas.
+    - name: Verificar que los nodos de computo quedaron registrados y en servicio
+      ansible.builtin.shell: |
+        set -uo pipefail
+        rc=0
+        for n in {{ groups['compute'] | map('extract', hostvars, 'ansible_hostname') | join(' ') }}; do
+          state=$(timeout 30 scontrol show node "$n" 2>/dev/null \
+                  | grep -oE '(^|[[:space:]])(Node)?State=[^[:space:]]+' \
+                  | head -1 | cut -d= -f2)
+          printf '  %s -> %s\n' "$n" "${state:-NO REGISTRADO}"
+          case "$state" in
+            RUNNING|IDLE|MIXED) ;;
+            *) rc=1 ;;
+          esac
+        done
+        exit $rc
+      register: slurm_node_registro
+      changed_when: false
+      retries: 12
+      delay: 5
+      until: slurm_node_registro.rc == 0
+
 
 # ----------------------------------------------------------------------------
 # 8. Open OnDemand en Ubuntu 26.04 (Apache2 + TLS + Slurm + LDAP)
@@ -1527,6 +1769,23 @@
       register: ood_create_home_result
       changed_when: "'CHANGED' in ood_create_home_result.stdout"
 
+    - name: Crear /var/tmp de cada usuario OOD
+      # La tarea de "reparar" de abajo asomia que este directorio ya existe, pero
+      # nada lo creaba nunca: en una instalacion limpia chown -R fallaba con
+      # "cannot access '/var/tmp/admin': No such file or directory" y tumbaba el
+      # play. OOD tampoco lo crea solo, lo usa en cuanto entra el primer PUN.
+      #
+      # Se reaprovecha home_user_mode por ser la misma intencion: directorio
+      # por usuario, setgid para que hereden el grupo, escribible por el grupo.
+      ansible.builtin.file:
+        path: "/var/tmp/{{ item }}"
+        state: directory
+        owner: "{{ item }}"
+        group: "{{ home_group }}"
+        mode: "{{ home_user_mode }}"
+      loop: "{{ [ldap_test_user, ldap_second_user] | reject('none') | reject('undefined') | list }}"
+      when: item is defined and item | length > 0
+
     - name: Reparar el propietario de /var/tmp de cada usuario OOD
       # /var/tmp/<user> guarda la cache de la PUN y los archivos de sesion.
       # OOD los crea con el UID que el usuario tenia en ese momento; si despues se
@@ -1536,7 +1795,8 @@
       #
       # Se usa chown -R y NO el modulo file: OOD crea subdirectorios de cache con
       # permisos 755 y archivos de sesion dentro, asi que arreglar solo el dir
-      # padre deja los archivos viejos sin escribir y el error persiste.
+      # padre deja los archivos viejos sin escribir y el error persiste. La
+      # creacion del directorio la hace la tarea de arriba.
       ansible.builtin.command: >
         chown -R {{ item }}:{{ home_group }} /var/tmp/{{ item }}
       loop: "{{ [ldap_test_user, ldap_second_user] | reject('none') | reject('undefined') | list }}"
@@ -1790,6 +2050,69 @@
       failed_when: "'proxying from' not in ood_websockify_check.stdout"
 
     # --- Configuración de ood_portal.yml ---
+    - name: Averiguar el nombre real de host de cada nodo de cómputo
+      # host_regex tiene que cubrir el NodeName que Slurm reporta, y ese NodeName
+      # sale de ansible_hostname del nodo (ver templates/slurm.conf.j2), NO del
+      # alias del inventory: acá el alias es worker1 pero el NodeName real es
+      # workf. Con un regex fijo que no incluya 'workf', el LocationMatch de
+      # Apache no matchea /node/workf/<puerto> y TODAS las apps interactivas
+      # devuelven 404 al pulsar "Connect", con la sesión corriendo de fondo.
+      ansible.builtin.setup:
+        gather_subset: min
+      delegate_to: "{{ item }}"
+      loop: "{{ groups['compute'] | default([]) }}"
+      register: ood_compute_names
+      changed_when: false
+
+    - name: Armar la lista de nombres de host que el proxy debe aceptar
+      # Alternancia sin anchors ^ $ a propósito: OOD embebe el valor tal cual en
+      # "LocationMatch \"^/node/(?<host>#{host_regex})/(?<port>\d+)\"". Con anchors
+      # el grupo queda (?<host>^(work|work2)$) y el ^ interior exige estar en la
+      # posición 0 del subject, que ya se consumió con "/node/", así que no
+      # matchea nunca y /node y /rnode devuelven 404.
+      ansible.builtin.set_fact:
+        ood_proxy_node_names: "{{ ood_compute_names.results | map(attribute='ansible_facts.ansible_hostname') | select('defined') | select('ne', '') | list | unique + (ood_proxy_host_regex_extra | default([])) }}"
+
+    - name: Armar host_regex con los nombres reales más los extra de group_vars
+      # regex_escape evita que un hostname con '.' se lea como comodín.
+      ansible.builtin.set_fact:
+        ood_proxy_host_regex: "({{ ood_proxy_node_names | map('regex_escape') | join('|') }})"
+
+    - name: Verificar que host_regex no haya quedado vacío
+      # Si quedara vacío (play corrido con --limit y sin nodos de compute
+      # alcanzables) el LocationMatch sería /node//<puerto> y todas las apps
+      # volverían a dar 404 en silencio.
+      ansible.builtin.assert:
+        that:
+          - ood_proxy_host_regex | length > 2
+        fail_msg: >-
+          host_regex quedo vacio: no se pudo resolver ningun hostname de
+          {{ groups['compute'] | default([]) | length }} nodos de compute.
+          Sin esto /node y /rnode devuelven 404 para todas las apps.
+
+    - name: Verificar que el LocationMatch que va a generar OOD matchee cada nodo
+      # Se prueba el patron EXACTO que update_ood_portal arma a partir de
+      # host_regex, no el regex suelto: importan tanto los anchors como el
+      # nombre de cada nodo. Asi un host faltante (NodeName=workf contra un
+      # host_regex '(work|work2)') falla en el deploy en vez de esperar a que
+      # un usuario presione "Connect" y vea un 404.
+      ansible.builtin.assert:
+        that:
+          - ('/node/' ~ item ~ '/8080') | regex_search(py_pattern) is not none
+        fail_msg: >-
+          El LocationMatch que va a generar OOD no matchea el NodeName '{{ item }}':
+          /node/{{ item }}/<puerto> daria 404 y el boton Connect de las apps
+          interactivas no funcionaria. host_regex quedo: {{ ood_proxy_host_regex }}
+        quiet: true
+      vars:
+        # Se prueba el patron que update_ood_portal arma a partir de
+        # host_regex, escrito en sintaxis Python y no en la PCRE de Apache
+        # porque regex_search es de Python: (?<host>...lanza "unknown extension
+        # ?<h" y el assert falla siempre, haciendo creer que el regex esta mal
+        # cuando lo que esta mal es el test.
+        py_pattern: '^/node/(?P<host>{{ ood_proxy_host_regex }})/(?P<port>\d+)'
+      loop: "{{ ood_proxy_node_names }}"
+
     - name: Configurar ood_portal.yml con HTTPS y LDAP
       ansible.builtin.copy:
         dest: /etc/ood/config/ood_portal.yml
@@ -1806,6 +2129,15 @@
           host_regex: '{{ ood_proxy_host_regex }}'
           node_uri: '/node'
           rnode_uri: '/rnode'
+          # Sin esto el vhost sale con la linea "SetEnv OOD_USER_MAP_MATCH"
+          # comentada, node_proxy.lua no puede mapear REMOTE_USER a un usuario
+          # de sistema, y devuelve 404 explicitamente desde Lua
+          # ("failed to map user") en vez de rutear al nodo. Por eso los botones
+          # "Connect" de Jupyter / VS Code / Desktop dan 404 con la sesion
+          # corriendo de fondo y Apache no loguea ningun error: no es un 404
+          # de Apache sino un http404() del propio handler.
+          # '.*' = el usuario de LDAP se usa tal cual como usuario de Unix.
+          user_map_match: '.*'
           # listen / ssl / auth van en el mismo nivel que servername: la
           # estructura 'portal:' anidada hace que update_ood_portal reporte
           # "'auth' section in ood_portal.yml is still missing" y genere un
@@ -1883,6 +2215,16 @@
           grep -oE '\(\?<host>[^)]*\)' "$VHOST" | head -2
           exit 1
         fi
+        # Sin OOD_USER_MAP_MATCH, node_proxy.lua no puede mapear REMOTE_USER a
+        # un usuario de sistema y devuelve 404 explicitamente desde Lua
+        # ("failed to map user"). No aparece nada en el error log de Apache,
+        # porque el 404 no lo genera Apache: parece un problema de rutas cuando
+        # en realidad el LocationMatch matchea bien y el handler no rutea.
+        grep -q '^  SetEnv OOD_USER_MAP_MATCH' "$VHOST" || {
+          echo "el vhost no tiene SetEnv OOD_USER_MAP_MATCH: node_proxy.lua no puede"
+          echo "mapear el usuario y devuelve 404 en todas las apps interactivas"
+          exit 1
+        }
       args:
         executable: /bin/bash
       register: ood_vhost_check
@@ -1907,17 +2249,41 @@
         state: restarted
 
 # ============================================================================
-# 9. Aprovisionar Monitoreo (Prometheus + Grafana)
+# 9. Aprovisionar Prometheus en el master (es el que scrapea el cluster)
 # ============================================================================
-- name: "9. Instalar Prometheus y Grafana para Monitoreo de Slurm"
+- name: "9. Instalar Prometheus y node_exporter para Monitoreo de Slurm"
   hosts: master
   become: true
   tags: [grafana]
   tasks:
+    - name: Instalar Prometheus y node_exporter
+      ansible.builtin.apt:
+        name:
+          - prometheus
+          - prometheus-node-exporter
+        state: present
+        update_cache: true
+
+    - name: Entregar el directorio de textfile al usuario de node_exporter
+      # El play 3 creo /var/lib/node_exporter como root porque todavia no
+      # existia el usuario prometheus (lo crea el paquete de arriba). Recien
+      # ahora se puede asignarle el dueno, que es como lo deja el paquete.
+      ansible.builtin.file:
+        path: "{{ node_exporter_textfile_dir }}"
+        state: directory
+        owner: "{{ node_exporter_user }}"
+        group: "{{ node_exporter_group }}"
+        mode: '0755'
+      notify: Reiniciar node-exporter
+
     - name: Habilitar el textfile collector de node_exporter
       # Sin esto node_exporter ignora por completo /var/lib/node_exporter y el
       # .prom que escribe el exporter de Slurm no aparece en /metrics. El
       # paquete de Ubuntu deja ARGS="" en /etc/default/prometheus-node-exporter.
+      #
+      # Va DESPUES del apt install a proposito: ese archivo lo crea el paquete,
+      # asi que con el lineinfile antes fallaba en una instalacion limpia con
+      # "Destination /etc/default/prometheus-node-exporter does not exist".
       ansible.builtin.lineinfile:
         path: /etc/default/prometheus-node-exporter
         regexp: '^ARGS='
@@ -1925,17 +2291,108 @@
         mode: '0644'
       notify: Reiniciar node-exporter
 
-    - name: Instalar paquetes básicos de monitoreo
-      ansible.builtin.apt:
-        name:
-          - prometheus
-          - prometheus-node-exporter
-          - apt-transport-https
-          - software-properties-common
-          - wget
-        state: present
-        update_cache: true
 
+    - name: Iniciar y habilitar Prometheus y node_exporter
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: started
+        enabled: true
+      loop:
+        - prometheus
+        - prometheus-node-exporter
+
+    - name: Desplegar configuracion de scrape de Prometheus
+      # Sin esto Prometheus se queda con su archivo por defecto, que no trae
+      # ningun scrape_configs: no scrapea nada y el dashboard del clustro
+      # aparece vacio sin ningun error que lo explique.
+      # El slurm_exporter del play 3 escribe en el textfile collector del
+      # node_exporter del master, asi que el job "node" es el que alimenta las
+      # metricas de Slurm. Los targets se derivan del inventory y no de IPs
+      # escritas a mano, asi que la config acompana los cambios de topologia.
+      ansible.builtin.copy:
+        dest: /etc/prometheus/prometheus.yml
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          global:
+            scrape_interval: 15s
+          scrape_configs:
+            - job_name: prometheus
+              static_configs:
+                - targets: ['{{ prometheus_host }}:{{ prometheus_port }}']
+            - job_name: node
+              static_configs:
+                - targets: ['127.0.0.1:{{ node_exporter_port }}']
+      notify: Reiniciar prometheus
+
+    - name: Fijar la direccion de escucha de Prometheus
+      # NO se puede dejar en 127.0.0.1: Grafana esta en el nodo OOD y consulta
+      # este datasource por red, asi que con loopback el dashboard abre vacio.
+      #
+      # Lo que si se acota es la interfaz: el default del paquete es 0.0.0.0,
+      # que abre el puerto en todas las interfaces del master. Se ata a la IP
+      # del master, que es justo la que usa el datasource, y no se toca el
+      # firewall.
+      #
+      # Va despues del apt install porque /etc/default/prometheus lo crea el
+      # paquete: con el lineinfile antes fallaba con "Destination does not exist".
+      ansible.builtin.lineinfile:
+        path: /etc/default/prometheus
+        regexp: '^ARGS='
+        line: 'ARGS="--web.listen-address={{ prometheus_host }}:{{ prometheus_port }}"'
+        mode: '0644'
+      notify: Reiniciar prometheus
+
+
+    - name: Aplicar handlers antes de verificar
+      # El reinicio de prometheus y de grafana por notify corre al FINAL del
+      # play. Sin este flush la verificacion se haria contra el proceso viejo,
+      # con la configuracion anterior, y fallaria en la primera corrida.
+      ansible.builtin.meta: flush_handlers
+
+    - name: Verificar que Prometheus scrapea al menos un target
+      # Un prometheus.yml mal formado, o un prometheus.yml correcto pero sin
+      # ningun target que responda, deja el dashboard del clustro vacio sin
+      # ningun error en ningun lado. Se consulta la API y se exige al menos un
+      # target activo.
+      ansible.builtin.uri:
+        url: "http://{{ prometheus_host }}:{{ prometheus_port }}/api/v1/targets"
+        return_content: true
+      register: prom_targets
+      retries: 10
+      delay: 6
+      until: (prom_targets.json.data.activeTargets | default([]) | length) > 0
+
+
+  handlers:
+    - name: Reiniciar prometheus
+      # El handler va en ESTE play porque la tarea que escribe prometheus.yml
+      # esta aca; los handlers no se heredan entre plays.
+      ansible.builtin.systemd:
+        name: prometheus
+        state: restarted
+
+    - name: Reiniciar node-exporter
+      # La tarea que habilita el textfile collector esta en ESTE play, asi que
+      # el handler tiene que estar aca y no en el del master.
+      ansible.builtin.systemd:
+        name: prometheus-node-exporter
+        state: restarted
+
+
+# ============================================================================
+# 10. Aprovisionar Grafana en el nodo Open OnDemand (junto al Apache del portal)
+# ============================================================================
+# Grafana va en el nodo OOD y NO en el master: el unico acceso publico es el
+# proxy de Apache, y para que ese proxy funcione Grafana tiene que estar en la
+# misma maquina que Apache. En el master no hay apache2 instalado, asi que
+# escribir aca el conf del vhost fallaba con "No such file or directory".
+- name: "10. Instalar Grafana detras del portal Open OnDemand"
+  hosts: ondemand
+  become: true
+  tags: [grafana]
+  tasks:
     - name: Importar clave GPG de Grafana
       ansible.builtin.get_url:
         url: https://apt.grafana.com/gpg.key
@@ -1953,14 +2410,12 @@
         name: grafana
         state: present
 
-    - name: Iniciar y habilitar Prometheus y Grafana
+
+    - name: Iniciar y habilitar Grafana
       ansible.builtin.systemd:
-        name: "{{ item }}"
+        name: grafana-server
         state: started
         enabled: true
-      loop:
-        - prometheus
-        - grafana-server
 
     - name: Vincular Grafana solo a loopback
       # Con http_addr en 0.0.0.0 el puerto queda abierto a toda la LAN y
@@ -2046,6 +2501,15 @@
         value: "true"
       notify: Reiniciar grafana
 
+    - name: Permitir auto-registro para auth.proxy
+      # Grafana crea automaticamente al usuario que llega via proxy.
+      ansible.builtin.ini_file:
+        path: /etc/grafana/grafana.ini
+        section: auth.proxy
+        option: auto_sign_up
+        value: "true"
+      notify: Reiniciar grafana
+
     - name: Declarar la cabecera de identidad que envía Apache
       ansible.builtin.ini_file:
         path: /etc/grafana/grafana.ini
@@ -2099,9 +2563,10 @@
               type: prometheus
               uid: prometheus
               access: proxy
-              # Grafana corre nativo en este host (no en un contenedor), asi que
-              # Prometheus es alcanzable por loopback.
-              url: http://127.0.0.1:9090
+              # Grafana corre en el nodo OOD y Prometheus en el master, asi que
+              # el datasource va por red. Con loopback (127.0.0.1) el panel
+              # aparece sin datos y no hay ningun error que lo explique.
+              url: "http://{{ prometheus_host }}:{{ prometheus_port }}"
               isDefault: true
               editable: false
               jsonData:
@@ -2244,27 +2709,29 @@
           url: "{{ grafana_sub_path }}"
           category: Jobs
 
-  handlers:
-    - name: Reiniciar node-exporter
-      # La tarea que habilita el textfile collector esta en ESTE play, asi que
-      # el handler tiene que estar aca y no en el del master.
-      ansible.builtin.systemd:
-        name: prometheus-node-exporter
-        state: restarted
 
+    - name: Aplicar handlers antes de verificar
+      # El reinicio de prometheus y de grafana por notify corre al FINAL del
+      # play. Sin este flush la verificacion se haria contra el proceso viejo,
+      # con la configuracion anterior, y fallaria en la primera corrida.
+      ansible.builtin.meta: flush_handlers
+
+  handlers:
     - name: Reiniciar grafana
       ansible.builtin.systemd:
         name: grafana-server
         state: restarted
     - name: Reiniciar apache
+      # El handler va aca porque este es el play que escribe el conf de Apache
+      # de Grafana; en el master no hay apache2 y este handler no existiria.
       ansible.builtin.systemd:
         name: apache2
         state: restarted
 
 # ============================================================================
-# 10. Instalar Aplicaciones Interactivas en OOD (Jupyter y VS Code)
+# 11. Instalar Aplicaciones Interactivas en OOD (Jupyter y VS Code)
 # ============================================================================
-- name: "10. Instalar Aplicaciones Interactivas (Jupyter y VS Code)"
+- name: "11. Instalar Aplicaciones Interactivas (Jupyter y VS Code)"
   hosts: ondemand
   become: true
   tags: [interactive]
@@ -2323,7 +2790,7 @@
         state: restarted
 
 # ============================================================================
-# 11. Pila VNC en los nodos de computo (para la app Desktop de OOD)
+# 12. Pila VNC en los nodos de computo (para la app Desktop de OOD)
 # ============================================================================
 # Es un play aparte y NO una tarea delegate_to del play 8 a proposito:
 # delegar a 'compute' desde un play que corre en 'ondemand' rompe el include
@@ -2339,7 +2806,7 @@
 #
 # Es un escritorio minimo a proposito, no gnome/kde/mate: el objetivo es una
 # terminal dentro del navegador y un DE completo son cientos de MB por nodo.
-- name: "11. Instalar la pila VNC en los nodos de computo"
+- name: "12. Instalar la pila VNC en los nodos de computo"
   hosts: compute
   become: true
   tags: [vnc, compute]

@@ -1,8 +1,8 @@
 # Identidad del clúster
 ClusterName={{ slurm_cluster_name }}
 {% set master_node = groups['master'][0] %}
-{% set master_host = hostvars[master_node]['ansible_facts']['hostname'] | default('master') %}
-{% set master_ip = hostvars[master_node]['ansible_host'] | default(hostvars[master_node]['ansible_facts']['default_ipv4']['address']) %}
+{% set master_host = hostvars[master_node]['ansible_hostname'] | default(master_node) %}
+{% set master_ip = hostvars[master_node]['ansible_host'] | default(hostvars[master_node]['ansible_default_ipv4']['address']) %}
 SlurmctldHost={{ master_host }}({{ master_ip }})
 
 # Autenticación y demonios
@@ -15,6 +15,13 @@ StateSaveLocation=/var/spool/slurmctld
 SlurmdSpoolDir=/var/spool/slurmd
 SwitchType=switch/none
 MpiDefault=none
+# Sin --with-pmix: los .deb de packages/ubuntu26/ se compilaron sin soporte
+# PMIx, asi que no existe ningun plugin mpi/pmix* en PluginDir. Poner
+# MpiDefault=pmix o pmix_v5 aca cuelga todo srun, incluso en serie.
+#
+# Sin esto slurmctld arranca pero avisa "Configured MailProg is invalid": el
+# default de Slurm es /bin/mail y en Ubuntu 26.04 no existe (tampoco sendmail).
+MailProg=/bin/true
 
 # Procesos, Scheduling y Recursos Genéricos (GRES / GPU)
 SlurmctldPidFile=/run/slurm/slurmctld.pid
@@ -42,14 +49,14 @@ JobAcctGatherFrequency=30
 # Definición Dinámica de Nodos de Cómputo (Ansible Facts + GRES)
 
 {% for node in groups['compute'] %}
-{% set node_host = hostvars[node]['ansible_facts']['hostname'] | default(node) %}
-{% set node_ip = hostvars[node]['ansible_host'] | default(hostvars[node]['ansible_facts']['default_ipv4']['address'] | default(node)) %}
-{% set cpus = hostvars[node]['ansible_facts']['processor_vcpus'] | default(1) %}
-{% set mem = ((hostvars[node]['ansible_facts']['memtotal_mb'] | default(1024)) * 0.9) | int %}
+{% set node_host = hostvars[node]['ansible_hostname'] | default(node) %}
+{% set node_ip = hostvars[node]['ansible_host'] | default(hostvars[node]['ansible_default_ipv4']['address'] | default(node)) %}
+{% set cpus = hostvars[node]['ansible_processor_vcpus'] | default(1) %}
+{% set mem = ((hostvars[node]['ansible_memtotal_mb'] | default(1024)) * 0.9) | int %}
 {% set gpus = hostvars[node]['detected_gpus'] | default(0) | int %}
 NodeName={{ node_host }} NodeAddr={{ node_ip }} CPUs={{ cpus }} RealMemory={{ mem }}{% if gpus > 0 %} Gres=gpu:{{ gpus }}{% endif %} Feature={{ hostvars[node]['node_feature'] | default('standperf') }} State=UNKNOWN
 {% endfor %}
 
 # Definición de Partición
 
-PartitionName={{ slurm_partition_name }} Nodes={% for node in groups['compute'] %}{{ hostvars[node]['ansible_facts']['hostname'] | default(node) }}{% if not loop.last %},{% endif %}{% endfor %} Default=YES MaxTime=INFINITE State=UP
+PartitionName={{ slurm_partition_name }} Nodes={% for node in groups['compute'] %}{{ hostvars[node]['ansible_hostname'] | default(node) }}{% if not loop.last %},{% endif %}{% endfor %} Default=YES MaxTime=INFINITE State=UP

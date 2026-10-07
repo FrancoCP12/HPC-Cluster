@@ -30,3 +30,11 @@ packages/Rocky/
 # Keep templates tracked (already are)
 !templates/
 !templates/**
+
+# Python bytecode: __pycache__ no aporta nada y se regenera solo.
+#
+# Tiene que ir SIEMPRE al final: en .gitignore gana la ultima regla que
+# matchea, y mas abajo hay un "!files/**" muy amplio que, si se evaluara
+# despues, volveria a incluir los .pyc dentro de files/.
+__pycache__/
+*.py[cod]

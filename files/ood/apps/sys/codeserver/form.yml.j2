@@ -12,7 +12,7 @@ attributes:
   bc_num_hours:
     label: "Duración maxima"
     value: "04:00:00"
-    widget: "text"
+    widget: "text_field"
   bc_num_cores:
     label: "Cores"
     value: "{{ interactive_num_cores_default }}"
@@ -22,7 +22,7 @@ attributes:
     widget: "number_field"
   slurm_args:
     label: "Argumentos Slurm (opcional)"
-    widget: "text"
+    widget: "text_field"
     value: ""
     help: "Solo flags permitidos: --mem, --cpus-per-task, --gres, --time, -J, --partition (se validarán al generar el script)"
     placeholder: "--mem=8G --cpus-per-task=4"
