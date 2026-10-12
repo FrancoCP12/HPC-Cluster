@@ -477,26 +477,30 @@ _fork_all_tasks: IO setup failed: Slurmd could not connect IO   -> job muere con
 Usá `--chdir=/tmp` / `--chdir=/shared/<dir>` o, para usuarios LDAP, el home compartido
 `/export/home/<user>`.
 
-### MPI desde Open OnDemand (app `MPI`)
+### MPI desde Open OnDemand (Job Composer)
 
-El portal trae una app **Interactive Apps → MPI (OpenMPI)** (código en
-`files/ood/apps/sys/mpi/`) que arma y envía el job MPI por vos. Elegís:
+El portal corre el cluster vía el **Job Composer** (app de sistema `sys/myjobs`, categoría
+Jobs): se crea un job a partir de un template, se edita el script y se lanza, todo junto
+— sin formularios sueltos. El template **MPI (OpenMPI)** se despliega en
+`{{ ood_config_root }}/apps/myjobs/templates/mpi_omp/`
+(`files/ood/apps/sys/myjobs/templates/mpi_omp/` en el repo).
 
-- **Nodos** (1..cantidad de nodos `compute`, por defecto 2),
-- **Tasks por nodo** (por defecto 1; ver límite abajo),
-- **Programa MPI** (ruta absoluta; por defecto `/usr/bin/hostname`, que con 2 ranks
-  imprime el nombre de cada nodo — sirve para verificar el reparto sin compilar nada),
-- **Argumentos** (opcional),
-- y la duración.
+Flujo del investigador:
 
-La app no expone un servicio web: su `template/script.sh.erb` corre
-`mpirun -np <nodos × tasks> <programa>` dentro del job. La salida del job queda en
-`output.log` y **se muestra en la propia tarjeta** (`info.html.erb`, que OOD renderiza
-como Markdown). Para el log completo, el **Session ID** de la tarjeta abre el directorio
-de la sesión en `Files`.
+1. Menú **Jobs → Job Composer** → **+ Nuevo job** → elegir el template **MPI (OpenMPI)**
+   (system). El Job Composer copia el directorio del template a tu espacio de trabajo y
+   abre `mpi.sbatch` en el editor.
+2. Editar **solo el bloque superior** del script, los valores marcados con `←`:
+   `-N` (nodos), `--ntasks` (ranks totales), `--cpus-per-task` (cores por rank),
+   `-t` (duración), la variable `PROGRAM` (tu binario) y `ARGS` (argumentos).
+   El `mpirun` de abajo toma la cantidad de ranks de `SLURM_NTASKS`, así que no hace
+   falta repetir el número.
+3. Job Options: host `clusterUTN` (ya preseleccionado), script `mpi.sbatch` → **Lanzar**.
+4. El estado se ve en **Active Jobs** y la salida queda en el directorio del job
+   (visible en **Files**).
 
 Para correr un MPI propio, compilalo con `mpicc` sobre el FS compartido y poné esa ruta
-en el formulario:
+en `PROGRAM`:
 
 ```bash
 cat > /shared/hello.c <<'EOF'
@@ -516,12 +520,12 @@ EOF
 mpicc /shared/hello.c -o /shared/hello     # dejalo en /shared o en /export/home/<user>
 ```
 
-Límite a tener en cuenta (el mismo que en las otras apps): `work2` tiene **1 CPU**, así
-que `Tasks por nodo = 1`. Pedir más deja el job en `PENDING` para siempre
-(`MinCPUsNode`). El máximo de nodos sale del grupo `compute` del inventario
-(`mpi_num_nodes_max` en `group_vars/all.yml`).
+Límite a tener en cuenta (mismo criterio que el que tenían las apps): `work2` tiene
+**1 CPU**, así que con `--cpus-per-task=1` pedí `--ntasks` acorde a lo que el cluster
+tenga libre (4 núcleos en total hoy). Pedir más de lo que hay deja el job en `PENDING`
+todo el día (`MinCPUsNode`).
 
-> **Por qué `unset SLURM_EXPORT_ENV` en `template/script.sh.erb` (no lo borres).**
+> **Por qué el template trae `unset SLURM_EXPORT_ENV` (no lo borres).**
 > OOD envía el job con `--export=NONE` (default de `ood_core`), así que el job hereda
 > `SLURM_EXPORT_ENV=NONE`. El `srun` que `mpirun` (PRRTE, componente `plm:slurm`) lanza
 > para arrancar el daemon `prted` hereda ese modo y lo ejecuta con un entorno **vacío**
@@ -529,8 +533,8 @@ que `Tasks por nodo = 1`. Pedir más deja el job en `PENDING` para siempre
 > `slurmstepd: error: execve(): prted: No such file or directory` → `srun-failed`
 > (PRRTE sólo muestra *"You were supposed to get help about: srun-failed"*, sin la causa
 > real). Haciendo `unset SLURM_EXPORT_ENV` el `srun` interno exporta el entorno del job
-> (que **sí** trae `PATH`) al step y `prted` arranca. Sin ese `unset` la app compila y
-> envía el job pero éste muere al instante.
+> (que **sí** trae `PATH`) al step y `prted` arranca. Sin ese `unset` el job compila y
+> se envía pero muere al instante.
 
 ---
 
@@ -558,7 +562,7 @@ que `Tasks por nodo = 1`. Pedir más deja el job en `PENDING` para siempre
 | `gres.conf`: `unsupported operand type(s) for -: 'AnsibleUnsafeText' and 'int'` | Expresión Jinja evaluada en línea comentada | Ya corregido: comentarios `{# ... #}` nativos de Jinja + casteo `(detected_gpus | int) - 1`. |
 | GPU detectadas pero `sinfo` muestra `gres=(null)` | `slurmctld` sin reconfigurar | `scontrol reconfigure` (el play lo hace; manual: reintentar). |
 | Mount NFS cuelga el boot | NFS no disponible al arrancar | `_netdev` en fstab ya añadido; verificar orden de arranque con `systemctl status nfs-client.target`. |
-| App MPI en OOD: job `Completed`/`FAILED` al instante con *"Sorry! You were supposed to get help about: srun-failed"* | OOD envía con `--export=NONE` → `SLURM_EXPORT_ENV=NONE` → el `srun` interno de PRRTE lanza `prted` con entorno vacío | Ya corregido en `template/script.sh.erb` con `unset SLURM_EXPORT_ENV`. Para ver la causa real (`execve(): prted: No such file or directory`) correr `mpirun` con `OMPI_MCA_plm_base_verbose=100`. |
+| Job MPI en OOD via Job Composer: `Completed`/`FAILED` al instante con *"Sorry! You were supposed to get help about: srun-failed"* | OOD envía con `--export=NONE` → `SLURM_EXPORT_ENV=NONE` → el `srun` interno de PRRTE lanza `prted` con entorno vacío | Ya corregido en el template con `unset SLURM_EXPORT_ENV`. Para ver la causa real (`execve(): prted: No such file or directory`) correr `mpirun` con `OMPI_MCA_plm_base_verbose=100`. |
 
 ---
 

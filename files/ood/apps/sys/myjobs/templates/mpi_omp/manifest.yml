@@ -1,0 +1,22 @@
+# manifest.yml provee los atributos del template. Al copiarse el directorio
+# este archivo no se copia al job; solo define los valores por defecto que
+# quedan en la base de datos del Job Composer al crear el trabajo.
+
+# nombre del template y default del nombre del job al copiarse
+name: MPI (OpenMPI)
+
+# notas que se muestran al seleccionar el template
+notes: >-
+  Trabajo batch MPI con OpenMPI. Edita SOLO el bloque superior de mpi.sbatch
+  (nodos, ranks, cores, programa y argumentos) y pulsa Lanzar. mpirun toma los
+  ranks de SLURM_NTASKS, asi que no hace falta repetir el numero en el comando.
+  No borres la linea "unset SLURM_EXPORT_ENV": arregla el entorno que OOD
+  limpia al lanzar el job (PRRTE sin PATH). La salida queda en el directorio
+  del job (visible en Files).
+
+# script que se envia a la cola
+script: mpi.sbatch
+
+# id (host) del cluster en el que se lanza; si se omite usa el primero
+# encontrado. Debe coincidir con el id de /etc/ood/config/clusters.d/
+host: clusterUTN

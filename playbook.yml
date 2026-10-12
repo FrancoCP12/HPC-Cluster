@@ -1828,8 +1828,7 @@
     # nativa (arriba), asi que la pila VNC que la soportaba queda sin uso y se
     # quita: en este host, noVNC + websockify y el wrapper /opt/websockify/run
     # que el template vnc.rb de ood_core llamaba. OJO: el proxy /node y /rnode
-    # de ood_portal.yml NO se toca, porque lo siguen usando Jupyter, VS Code
-    # y MPI.
+    # de ood_portal.yml NO se toca, porque lo siguen usando Jupyter y VS Code.
     - name: Quitar el wrapper websockify de la PUN
       ansible.builtin.file:
         path: /opt/websockify
@@ -1930,7 +1929,7 @@
           # comentada, node_proxy.lua no puede mapear REMOTE_USER a un usuario
           # de sistema, y devuelve 404 explicitamente desde Lua
           # ("failed to map user") en vez de rutear al nodo. Por eso los botones
-          # "Connect" de Jupyter / VS Code / MPI dan 404 con la sesion
+          # "Connect" de Jupyter / VS Code dan 404 con la sesion
           # corriendo de fondo y Apache no loguea ningun error: no es un 404
           # de Apache sino un http404() del propio handler.
           # '.*' = el usuario de LDAP se usa tal cual como usuario de Unix.
@@ -2572,9 +2571,10 @@
         state: restarted
 
 # ============================================================================
-# 11. Instalar Aplicaciones Interactivas en OOD (Jupyter, VS Code y MPI)
+# 11. Instalar Aplicaciones Interactivas en OOD (Jupyter y VS Code) y
+#     desplegar templates del Job Composer (MPI via OpenMPI)
 # ============================================================================
-- name: "11. Instalar Aplicaciones Interactivas (Jupyter, VS Code y MPI)"
+- name: "11. Instalar Aplicaciones Interactivas (Jupyter, VS Code) y templates del Job Composer"
   hosts: ondemand
   become: true
   tags: [interactive]
@@ -2589,10 +2589,15 @@
       # La lista NO puede incluir jupyter/codeserver: esas son las apps propias
       # que se despliegan dos tareas mas abajo. Si aparecen aca, cada corrida las
       # borra y las vuelve a crear y el play nunca es idempotente.
+      #
+      # ood_apps_to_remove (group_vars/all.yml) lleva apps propias retiradas
+      # del portal, como la antigua app interactiva MPI (reemplazada por el
+      # template del Job Composer). El archivo sobrevivio en los nodos del
+      # deploy anterior y hay que limpiarlo.
       ansible.builtin.file:
         path: "{{ ood_apps_root }}/sys/{{ item }}"
         state: absent
-      loop: "{{ ood_third_party_apps_to_remove | default([]) }}"
+      loop: "{{ (ood_third_party_apps_to_remove | default([])) + (ood_apps_to_remove | default([])) }}"
 
     - name: Crear estructura de las apps interactivas
       ansible.builtin.file:
@@ -2625,6 +2630,21 @@
       loop_control:
         label: "{{ item.app }}/{{ item.dest }}"
       notify: Reiniciar apache
+
+    - name: Desplegar templates del Job Composer
+      # "Job Composer" es la app sys/myjobs (ver /var/www/ood/apps/sys/myjobs/
+      # manifest.yml). En produccion lee sus templates de la config (no de su
+      # APPROOT/templates): el codigo de templates_path usa
+      # ood_config_root/apps/myjobs/templates cuando APPROOT/templates no
+      # existe. Los archivos son estaticos (el Job Composer no renderiza ERB),
+      # por eso 'copy' y no 'template'.
+      ansible.builtin.copy:
+        src: "files/ood/apps/sys/myjobs/templates/"
+        dest: "{{ ood_config_root }}/apps/myjobs/templates/"
+        owner: root
+        group: root
+        mode: '0644'
+        directory_mode: '0755'
 
   handlers:
     - name: Reiniciar apache
