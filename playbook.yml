@@ -24,18 +24,7 @@
       failed_when: false
 
     # --- Desmontar el portal web viejo -------------------------------------
-    # sync_hpc_groups sincronizaba grupos de un portal HPC que ya no esta en el
-    # repo. Los archivos se habian borrado del repositorio pero quedaron vivos
-    # en los nodos de una instalacion anterior, y el timer seguia arrancando un
-    # script que ya no existe.
-    #
-    # Primero se deshabilita y para la unit: si se borran los archivos sin
-    # detener el timer, systemd lo reinicia en el siguiente tick y falla.
-    #
-    # Sin masked: a proposito. Enmascarar crea un symlink a /dev/null en
-    # /etc/systemd/system/<nombre>, que es exactamente la ruta que borra la
-    # tarea de abajo: las dos cosas se contradicen y el mask se lleva por
-    # delante. El borrado ya impide que arrancen.
+
     - name: Parar y deshabilitar el timer de sincronizacion de grupos del portal
       ansible.builtin.systemd:
         name: sync_hpc_groups.timer
@@ -354,18 +343,7 @@
 # ----------------------------------------------------------------------------
 # 1.0. Munge: la clave se genera en el MAESTRO y se reparte al resto
 # ----------------------------------------------------------------------------
-# Esta tarea vive en su propio play y NO dentro del play "1." a propósito.
-# El play "1." corre `hosts: all` con `serial: 1`, o sea de a un host por
-# lote. Con `delegate_to: master` + `run_once: true`, la orden de ejecución
-# queda atado al inventario: el paquete `munge` se instalaba solo en el host
-# del lote actual, mientras el comando delegado corría contra el master, que
-# todavia no habia pasado por el `apt`. Resultado: `create-munge-key: not
-# found` si el master no es el primer host.
-#
-# Ademas `run_once` NO corre una sola vez por play cuando hay `serial`: corre
-# una vez por lote (verificado). Por eso la clave se genera aqui, en un play
-# propio contra `hosts: master`, y se expone con `set_fact` para que el
-# play "1." la distribuya sin depender del orden de los lotes.
+
 - name: "1.0. Generar munge.key en el nodo maestro"
   hosts: master
   become: true
@@ -424,6 +402,16 @@
           - libpam-modules
         state: present
         update_cache: true
+
+    - name: Instalar OpenMPI (MPI distribuido en el cluster)
+      # openmpi-bin + libopenmpi-dev en TODOS los nodos: el master compila y
+      # lanza (mpirun/mpicc) y los workers ejecutan los ranks. Los jobs MPI se
+      # corren con `mpirun` dentro de una asignación de Slurm; ver mpi_packages
+      # en group_vars/all.yml y el comentario de MpiDefault en slurm.conf.j2.
+      ansible.builtin.apt:
+        name: "{{ mpi_packages }}"
+        state: present
+      tags: [mpi]
 
     - name: Iniciar Chrony
       ansible.builtin.systemd:
@@ -588,11 +576,6 @@
       notify: Reiniciar mysql
 
     - name: Ajustar MySQL a los valores que exige Slurm para accounting
-      # slurmdbd avisa "Database settings not recommended values:
-      # innodb_buffer_pool_size innodb_lock_wait_timeout". Con el buffer pool
-      # chico y un lock wait corto, el registro de eventos se traba en cuanto
-      # entra carga real. Se escribe antes del flush_handlers de abajo para que
-      # el unico reinicio de MySQL aplique el bind-address y esto juntos.
       ansible.builtin.copy:
         dest: /etc/mysql/mysql.conf.d/zz-slurm.cnf
         owner: root
@@ -607,8 +590,7 @@
     - name: Forzar flush para aplicar bind-address
       ansible.builtin.meta: flush_handlers
 
-    # El flush de arriba reinicia MySQL. Las tareas siguientes entran por el
-    # socket unix, asi que hay que esperar a que vuelva a aceptar conexiones.
+
     - name: Esperar a que MySQL vuelva a aceptar conexiones
       ansible.builtin.wait_for:
         port: "{{ slurm_db_port }}"
@@ -685,11 +667,7 @@
         enabled: true
         daemon_reload: true
 
-    # slurmdbd aborta con "This host not configured to run SlurmDBD" si DbdHost
-    # no coincide con el hostname real, y con eso slurmctld se queda sin
-    # ClusterID y el endpoint /nodes del slurmrestd responde 504 mucho despues,
-    # sin relacion apparent con la causa. Se espera el puerto aca para que el
-    # play 2 falle en el sitio correcto.
+
     - name: Esperar a que slurmdbd abra el puerto de accounting
       ansible.builtin.wait_for:
         port: "{{ slurmdbd_port }}"
@@ -807,31 +785,6 @@
       delay: 4
       until: slurmctld_ping.rc == 0
 
-    # --- slurmrestd: API REST de Slurm para el exporter de Prometheus --------
-    # El build de Slurm 24.11.7 de packages/ NO trae endpoint OpenMetrics: en el
-    # arbol de fuentes no hay ninguna cadena "metrics" bajo src/slurmrestd/, asi
-    # que /slurm/v1/metrics no existe y no hay nada que scrapear ahi. Lo que si
-    # sirve es la API REST, que es la que consume files/prometheus/slurm_exporter.py.
-    #
-    # Detalles no obvios de este demonio, todos verificados contra el fuente y
-    # contra el comportamiento real:
-    #
-    # 1) NO existe un archivo de configuracion propio de slurmrestd. En todo el
-    #    arbol de fuentes no hay ninguna referencia a "slurmrestd.conf": el flag
-    #    -f apunta al slurm.conf normal. Por eso un slurmrestd.conf propio con
-    #    ListenAddr= falla con "unrecognized key: ListenAddr".
-    # 2) La direccion de escucha es un ARGUMENTO POSICIONAL ("[host]:port" o
-    #    "unix:/ruta"), no una clave de configuracion. De ahi el ListenAddr.
-    # 3) Rechaza root ("should not be run as the root user"), SlurmUser
-    #    ("should not be run as SlurmUser") y el grupo de SlurmUser
-    #    ("should not be run with SlurmUser's group"). Necesita usuario y grupo
-    #    propios. Cuidado: si el usuario quedo antes en el grupo slurm hay que
-    #    sacarlo (groups: [] con append: false), si no sigue abortando.
-    # 4) Los unicos plugins de autenticacion de este build son rest_auth/local y
-    #    rest_auth/jwt. No hay auth/basic, asi que por TCP habria que emitir JWT.
-    #    Con socket UNIX se usa rest_auth/local y no hay que manejar claves.
-    # 5) La API es versionada: /slurm/v0.0.42/... y no /slurm/v1/... como de
-    #    costumbre. /slurm/v1 responde 404.
     - name: Copiar paquete slurmrestd desde packages/ubuntu26/
       ansible.builtin.copy:
         src: "{{ item }}"
@@ -874,10 +827,7 @@
         append: false
 
     - name: Permitir que slurmrestd lea la configuracion de accounting
-      # /etc/slurm/slurm.conf es 644 pero /etc/slurm/slurmdbd.conf es 600
-      # slurm:slurm, y sin lectura el plugin OpenAPI de slurmdbd falla con
-      # "Failure loading plugin path bindings". Se usa ACL para no abrir el
-      # archivo a todo el mundo como haria un chmod 644.
+
       ansible.builtin.file:
         path: /etc/slurm/slurmdbd.conf
         state: present
@@ -897,21 +847,6 @@
         mode: '0755'
 
     - name: Corregir la unit de systemd de slurmrestd
-      # El paquete deja la unit sin User=, sin RuntimeDirectory y con un
-      # ExecStart generico. Se sobrescribe entero. RuntimeDirectory hace systemd
-      # que cree /run/slurmrestd en cada arranque y lo borre al parar, que es
-      # justamente lo que necesita el socket UNIX (en /run no sobrevive al reboot).
-      #
-      # SLURM_JWT= (vacio) es lo importante: la unit del paquete trae
-      #   Environment=SLURM_JWT=daemon
-      #   Environment=SLURMRESTD_LISTEN=:6820
-      # Con SLURM_JWT=daemon slurmrestd autentica sus llamadas HACIA slurmctld
-      # con auth/jwt, y slurmctld responde
-      #   error: auth_g_unpack: authentication plugin auth/jwt(102) not found
-      # y el endpoint /slurm/v0.0.42/nodes devuelve 511
-      # "Protocol authentication error". Al parecer solo el demonio slurmrestd
-      # trae el plugin auth/jwt; slurmctld no. Vaciando la variable slurmrestd
-      # vuelve a munge, que es lo que ambos soportan.
       ansible.builtin.copy:
         dest: /etc/systemd/system/slurmrestd.service.d/override.conf
         owner: root
@@ -930,18 +865,7 @@
       notify: Reiniciar slurmrestd
 
     - name: Aplicar los handlers antes de verificar
-      # Imprescindible: el reinicio de slurmrestd llega por notify, y los
-      # handlers se ejecutan al FINAL del play. Sin este flush, la tarea de
-      # espera del socket y la de la API correrian contra el proceso VIEJO
-      # todavia con la configuracion anterior, y fallarian con datos
-      # desactualizados (511 Protocol authentication error) aunque el play
-      # terminara bien. Ademas, si el play fallara antes, el servicio
-      # quedaria sin reiniciar y el next run arrancaria con un config fantasma.
       ansible.builtin.meta: flush_handlers
-
-    # El flush de arriba reinicia slurmctld si el slurm.conf cambio. slurmrestd
-    # habla con el controlador, asi que sin esta espera la comprobacion de la
-    # API correria contra un slurmctld a medio reiniciar.
     - name: Reesperar a slurmctld tras el reinicio por handler
       ansible.builtin.command:
         argv:
@@ -966,9 +890,6 @@
         state: started
 
     - name: Comprobar que slurmrestd arranco con el usuario sin privilegios
-      # slurmrestd se niega a correr como root o como el SlurmUser; si el
-      # drop-in se perdiera, esto falla al arrancar y no de forma confusa
-      # mas adelante.
       ansible.builtin.command:
         argv:
           - pgrep
@@ -979,9 +900,6 @@
       changed_when: false
 
     - name: Comprobar que slurm_JWT quedo fuera del entorno
-      # Si SLURM_JWT este presente (incluso vacio) slurmrestd usa auth/jwt
-      # contra slurmctld y todos los endpoints devuelven 511. Falla ruidoso
-      # en el playbook en vez de dejar un Grafana vacio.
       ansible.builtin.command:
         argv:
           - bash
@@ -1003,9 +921,6 @@
         timeout: 60
 
     - name: Verificar que la API REST de slurmrestd responde
-      # Con socket UNIX la autenticacion la resuelve rest_auth/local sola, asi
-      # que no hacen falta credenciales. Si esto falla, el exporter no va a
-      # tener datos y hay que saberlo en el playbook, no en el panel de Grafana.
       ansible.builtin.uri:
         url: "http://localhost/slurm/{{ slurm_api_version }}/nodes"
         unix_socket: "{{ slurmrestd_socket }}"
@@ -1025,12 +940,6 @@
         mode: '0755'
 
     - name: Crear el directorio de textfile de node_exporter
-      # Sin owner "{{ node_exporter_user }}" a proposito: ese usuario lo crea el
-      # paquete prometheus-node-exporter, que se instala en el play 9, mas
-      # adelante. Ponerlo aca hace fallar el chown con "failed to look up user
-      # prometheus". El exporter de Slurm corre como root (su unit no tiene
-      # User=) asi que escribe igual, y node_exporter solo necesita leer los
-      # .prom. El play 9 le asigna el dueno cuando el usuario ya existe.
       ansible.builtin.file:
         path: "{{ node_exporter_textfile_dir }}"
         state: directory
@@ -1039,8 +948,6 @@
         mode: '0755'
 
     - name: Crear el timer del exporter de Slurm
-      # El exporter corre cada 30s con systemd en vez de cron para que no quede
-      # una entrada crontab suelta que nadie encuentra después.
       ansible.builtin.copy:
         dest: /etc/systemd/system/slurm-exporter.service
         owner: root
@@ -1081,8 +988,6 @@
       notify: Reiniciar slurm-exporter timer
 
     - name: Ejecutar el exporter de Slurm una vez
-      # Con changed_when: false para que la primera corrida no grite. Si el
-      # exporter falla aca, el problema se ve en el playbook y no en Grafana.
       ansible.builtin.command: /usr/local/bin/slurm_exporter.py
       environment:
         SLURMRESTD_SOCKET: "{{ slurmrestd_socket }}"
@@ -1100,8 +1005,6 @@
         daemon_reload: true
 
   handlers:
-    # Los handlers NO se heredan entre plays, asi que cada uno va en el play de
-    # la tarea que lo notifica.
     - name: Reiniciar slurmctld
       ansible.builtin.systemd:
         name: slurmctld
@@ -1149,9 +1052,6 @@
             mode: '2775'
 
         - name: Asegurar raiz de homes compartidos con setgid
-          # El bit setgid hace que cada home creado dentro herede el grupo, que
-          # es lo que permite que un home nuevo sea accesible sin cambiar el
-          # grupo a mano. Sin el, el home queda con el grupo primario del root.
           ansible.builtin.file:
             path: "{{ shared_home_root }}"
             state: directory
@@ -1160,8 +1060,6 @@
             mode: '{{ home_root_mode }}'
 
         - name: Eliminar montajes NFS locales residuales de fstab en el Master
-          # El master es el servidor de estos exports: si los monta sobre si
-          # mismo, un reboot lo deja trabado esperando al propio servidor.
           ansible.posix.mount:
             path: "{{ item }}"
             state: unmounted
@@ -1170,10 +1068,6 @@
             - "{{ shared_home_root }}"
 
         - name: Configurar /etc/exports
-          # Se escribe el archivo COMPLETO (no blockinfile) y se restringe con
-          # nfs_export_networks. Antes se publicaba con '*', que dejaba /shared
-          # y /home exportados a toda la red. /home deja de exportarse: es el
-          # home local del master y montarlo sobre los nodos tapa /home/work2.
           ansible.builtin.copy:
             dest: /etc/exports
             owner: root
@@ -1187,10 +1081,6 @@
               {% endfor %}
 
         - name: Crear la raiz de homes con setgid y grupo de referencia
-          # La crea el SERVIDOR, donde root no esta squasheado, para que el
-          # setgid quede garantizado aunque el nodo OOD todavia no haya montado
-          # el share. Los homes heredan asi el grupo y siguen siendo
-          # escribibles por el grupo aunque los cree root.
           ansible.builtin.file:
             path: "{{ shared_home_root }}"
             state: directory
@@ -1200,15 +1090,6 @@
 
 
         - name: Vaciar tabla de exportaciones del kernel
-          # exportfs -ra SOLO agrega entradas: las cargadas a mano con
-          # 'exportfs -o ...' siguen vivas en la tabla del kernel y quedan
-          # duplicadas frente a /etc/exports, lo que hace fallar -ra con
-          # 'duplicated export entries'. Hay que drenar la tabla primero.
-          #
-          # Se usa -ua en vez de una por entrada porque una entrada duplicada
-          # con opciones distintas (el /export/home manual tinha no_root_squash
-          # y el de /etc/exports no) hace que exportfs se niegue a
-          # desexportarla: la deja '[IGNORED]' y -ra vuelve a fallar igual.
           ansible.builtin.command: exportfs -ua
           register: exportfs_ua
           changed_when: "'unexporting' in exportfs_ua.stderr"
@@ -1236,8 +1117,6 @@
             state: present
 
         - name: Crear directorios de montaje
-          # Sin mode: con root_squash el mkdir remoteo como nobody no puede
-          # dejar el directorio en 0755.
           ansible.builtin.file:
             path: "{{ item }}"
             state: directory
@@ -1251,13 +1130,6 @@
             state: absent
 
         - name: Desmontar /home del Master de forma diferida
-          # /home del Master no se puede desmontar con 'umount' normal porque el
-          # home de este mismo usuario (work2) vive en el montaje: la sesión de
-          # SSH que está ejecutando Ansible lo tiene tomado y el umount falla
-          # con 'device is busy'.
-          # El desmontaje diferido (lazy) lo desengancha en el acto y solo deja
-          # de resolver nombres de archivos nuevos. Es lo que permite crear
-          # abajo el home local y dejar /home sin NFS de una vez.
           ansible.builtin.command: umount -l /home
           register: lazy_unmount_home
           changed_when: lazy_unmount_home.rc == 0
@@ -1267,15 +1139,6 @@
             - "'no mount point specified' not in lazy_unmount_home.stderr"
 
         - name: Asegurar home local de los usuarios del nodo
-          # Va DESPUES del desmontaje y antes de volver a montar nada: si el
-          # home local no existiera, el usuario del nodo quedaria sin poder
-          # hacer login, porque /home/work2 venia del NFS del master.
-          #
-          # La lista sale de getent en el HOST, no de ansible_facts: el fact
-          # getent_passwd no se recolecta en la corrida y por eso el loop
-          # sobre ansible_facts.getent_passwd fallaba con 'no such attribute'.
-          # El filtro shell || true evita que una home duplicada en otra
-          # entrada del mismo nombre corte el play.
           ansible.builtin.shell: |
             set -o pipefail
             getent passwd | while IFS=: read -r pw_name _pw uid gid gecos pw_dir shell; do
@@ -1380,12 +1243,6 @@
         state: present
 
     - name: Crear venv de JupyterLab en el nodo de cómputo
-      # El paquete de Ubuntu "jupyter" trae jupyter_core + notebook 6 pero NO
-      # jupyterlab, asi que "jupyter lab" fallaba con
-      # "Jupyter command `jupyter-lab` not found." y la sesion moria al arrancar.
-      # Se usa un venv en vez de pip --break-system-packages porque el Python del
-      # sistema es externally-managed (PEP 668) y el install por pip chocaba con
-      # typing_extensions de Debian ("no RECORD file was found").
       ansible.builtin.command: python3 -m venv /opt/jupyter
       args:
         creates: /opt/jupyter/bin/jupyter
@@ -1405,11 +1262,6 @@
       tags: [interactive]
 
     - name: Verificar que JupyterLab quede disponible
-      # "jupyter lab --version" imprime solo el numero de version. El caso que
-      # hay que atrapar es el que nos mordio: sin jupyterlab el subcomando no
-      # existe y responde "Jupyter command `jupyter-lab` not found.", que sale
-      # con codigo 0 en esta forma. Por eso se valida el FORMATO de la salida y
-      # no solo el return code.
       ansible.builtin.command: /opt/jupyter/bin/jupyter lab --version
       register: ood_jupyterlab_check
       changed_when: false
@@ -1547,19 +1399,14 @@
         seconds: 3
 
     - name: Limpiar posibles estados DRAIN y reanudar nodos
+      # OJO: hay que usar el NodeName real de Slurm (ansible_hostname), no el
+      # alias del inventario. 'scontrol update nodename=worker1' falla con
+      # "lookup failure for node" porque el nodo se llama workf, no worker1.
       ansible.builtin.shell: 'scontrol update nodename={{ item }} state=RESUME reason=""'
-      loop: "{{ groups['compute'] }}"
+      loop: "{{ groups['compute'] | map('extract', hostvars, 'ansible_hostname') | list }}"
       changed_when: false
       failed_when: false
 
-    # La tarea anterior tiene failed_when: false a proposito (un nodo en DRAIN
-    # no deberia tumbar el play), pero eso se traga tambien el caso real de un
-    # nodo que el controlador no conoce. Se verifica aparte, y en vez de un
-    # error opaco imprime el estado de cada nodo.
-    #
-    # OJO con el patron: Slurm 24.x emite "State=IDLE", no "NodeState=IDLE".
-    # Buscar solo NodeState hace que un nodo perfectamente registrado se
-    # reporte como "NO REGISTRADO". Por eso el patron acepta ambas formas.
     - name: Verificar que los nodos de computo quedaron registrados y en servicio
       ansible.builtin.shell: |
         set -uo pipefail
@@ -1708,9 +1555,6 @@
 
     # --- Configuración de Apache y Módulos ---
     - name: Habilitar authnz_ldap
-      # Módulo que IMPLEMENTA AuthBasicProvider ldap. Si falta, Apache no
-      # arranca con 'AH00526 Invalid command AuthBasicProvider'. Se habilita
-      # aparte de la lista de abajo para que el error sea atribuible.
       community.general.apache2_module:
         name: authnz_ldap
         state: present
@@ -1736,7 +1580,42 @@
         removes: /etc/apache2/sites-enabled/000-default.conf
       notify: Reiniciar apache
 
+    - name: Levantar MemoryDenyWriteExecute en Apache (necesario para el Shell JS)
+      # Ubuntu 26.04 endurecio apache2.service con MemoryDenyWriteExecute=yes
+      # (linea del unit en /usr/lib/systemd/system/apache2.service). Esa
+      # politica seccomp W^X (prohibe mprotect/mmap con PROT_EXEC) la heredan
+      # los procesos hijos de Apache, o sea la PUN y las apps Node que arranca,
+      # y V8 aborta con "Check failed: 12 == (*__errno_location ())" al no
+      # poder marcar memoria como ejecutable. Es lo que rompia la Terminal
+      # (sys/shell) aunque corriera bien a mano, fuera de systemd. Apache no
+      # necesita JIT: se desactiva SOLO esta capa, en un drop-in propio.
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/apache2.service.d/zz-memory.conf
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          [Service]
+          MemoryDenyWriteExecute=no
+      notify: Reiniciar apache
+
+    - name: Detectar la implementacion de sudo (clasico vs sudo-rs)
+      # Ubuntu 26.04 puede traer sudo-rs por defecto y las opciones de Defaults
+      # cambian: '!requiretty, !authenticate' solo existen en sudo clasico, y
+      # '!pwfeedback, !use_pty' son las que necesita sudo-rs (use_pty, que en
+      # sudo-rs viene activo, rompe la ejecucion no interactiva que dispara
+      # Apache). Escribir la opcion equivocada hace fallar visudo.
+      ansible.builtin.shell: |
+        set -o pipefail
+        if /usr/bin/sudo -V 2>&1 | grep -qi 'sudo-rs'; then echo sudo-rs; else echo classic; fi
+      register: ood_sudo_impl
+      changed_when: false
+
     - name: Sudoers para nginx_stage (PUN)
+      # Se replica el archivo oficial de OOD (packaging/files/sudo.erb). Antes se
+      # escribia SOLO la ultima linea: sin 'env_keep' sudo descarta el entorno
+      # OOD_*/NGINX_STAGE_* y, con sudo-rs, sin '!use_pty' el stop/start de la PUN
+      # que hace el boton "Restart Web Server" no funciona.
       ansible.builtin.copy:
         dest: /etc/sudoers.d/ood
         owner: root
@@ -1744,6 +1623,12 @@
         mode: '0440'
         validate: '/usr/sbin/visudo -cf %s'
         content: |
+          {% if ood_sudo_impl.stdout == 'sudo-rs' %}
+          Defaults:www-data !pwfeedback, !use_pty
+          {% else %}
+          Defaults:www-data !requiretty, !authenticate
+          {% endif %}
+          Defaults:www-data env_keep += "NGINX_STAGE_* OOD_*"
           www-data ALL=(ALL) NOPASSWD: /opt/ood/nginx_stage/sbin/nginx_stage
 
     - name: Desplegar script wrapper para creación segura de Home
@@ -1755,14 +1640,6 @@
         mode: '0755'
 
     - name: Crear y reparar el Home de cada usuario OOD
-      # El pre-hook de nginx_stage NO es configurable por YAML: la opcion existe
-      # solo como flag '-P/--pre-hook-root' del subcomando 'pun', y
-      # Configuration#read_configuration descarta cualquier clave del YAML que no
-      # sea un instance_variable suyo (solo avisa "invalid configuration option"
-      # por stderr y sigue). Por eso el home se garantiza desde Ansible.
-      #
-      # El mismo wrapper se sigue usando porque ya valida el home del getent,
-      # rechaza paths no absolutos y repara ~/ondemand de forma idempotente.
       ansible.builtin.command: "/usr/local/sbin/ood_create_home --user {{ item }}"
       loop: "{{ [ldap_test_user, ldap_second_user] | reject('none') | reject('undefined') | list }}"
       when: item is defined and item | length > 0
@@ -1770,13 +1647,6 @@
       changed_when: "'CHANGED' in ood_create_home_result.stdout"
 
     - name: Crear /var/tmp de cada usuario OOD
-      # La tarea de "reparar" de abajo asomia que este directorio ya existe, pero
-      # nada lo creaba nunca: en una instalacion limpia chown -R fallaba con
-      # "cannot access '/var/tmp/admin': No such file or directory" y tumbaba el
-      # play. OOD tampoco lo crea solo, lo usa en cuanto entra el primer PUN.
-      #
-      # Se reaprovecha home_user_mode por ser la misma intencion: directorio
-      # por usuario, setgid para que hereden el grupo, escribible por el grupo.
       ansible.builtin.file:
         path: "/var/tmp/{{ item }}"
         state: directory
@@ -1787,16 +1657,6 @@
       when: item is defined and item | length > 0
 
     - name: Reparar el propietario de /var/tmp de cada usuario OOD
-      # /var/tmp/<user> guarda la cache de la PUN y los archivos de sesion.
-      # OOD los crea con el UID que el usuario tenia en ese momento; si despues se
-      # corrige el uidNumber en LDAP quedan como el UID viejo y el PUN los abre en
-      # solo lectura. Es el mismo motivo por el que el home quedaba con el
-      # propietario equivocado.
-      #
-      # Se usa chown -R y NO el modulo file: OOD crea subdirectorios de cache con
-      # permisos 755 y archivos de sesion dentro, asi que arreglar solo el dir
-      # padre deja los archivos viejos sin escribir y el error persiste. La
-      # creacion del directorio la hace la tarea de arriba.
       ansible.builtin.command: >
         chown -R {{ item }}:{{ home_group }} /var/tmp/{{ item }}
       loop: "{{ [ldap_test_user, ldap_second_user] | reject('none') | reject('undefined') | list }}"
@@ -1804,31 +1664,6 @@
       changed_when: false
 
     - name: Inicializar la base SQLite de My Jobs si esta vacia
-      # My Jobs guarda todo en ~/ondemand/data/sys/myjobs/production.sqlite3, que
-      # vive DENTRO del home NFS y por eso la crea el propio OOD con el UID del
-      # momento. Si quedo a medio crear (4096 bytes, cero tablas) el portal
-      # revienta con "Could not find table 'jobs'" en /pun/sys/myjobs y no se
-      # arregla solito. rake db:migrate crea el schema.
-      #
-      # Solo corre si la tabla 'jobs' NO existe, asi que es idempotente de verdad.
-      # El GEM_PATH tiene que incluir las rutas del sistema: el Gemfile.lock de
-      # myjobs fija net-pop/net-smtp/webrick que NO estan en /opt/ood/gems, solo en
-      # /usr/lib/ruby/gems y /usr/share/rubygems-integration. Sin esas rutas
-      # bundler aborta con Bundler::GemNotFound antes de migrar nada.
-      # SECRET_KEY_BASE es obligatorio en production y solo se usa para esto: las
-      # migraciones no lo necesitan como valor real.
-      #
-      # IMPORTANTE: corre como el usuario, no como root.
-      # SQLite abre/crea los archivos -journal y -wal con el UID de quien
-      # escribe. Con rake en root la base quedaba utilizable pero cualquier
-      # escritura posterior del PUN caia en
-      # "SQLite3::ReadOnlyException: attempt to write a readonly database",
-      # que es el mismo fallo que traia el home con el UID viejo.
-      #
-      # La ruta usa $HOME en lugar de ood_user_data_root porque el home real de
-      # OOD lleva el subdirectorio 'ondemand' adelante. Con
-      # "{{ ood_user_data_root }}/{{ item }}/data/..." el test [ -f ] no
-      # encontraba nada y la tarea era codigo muerto: nunca habia migrado nada.
       ansible.builtin.shell: |
         set -euo pipefail
         db="{{ shared_home_root }}/{{ item }}/ondemand/data/sys/myjobs/production.sqlite3"
@@ -1925,43 +1760,57 @@
       changed_when: false
       failed_when: "'invalid configuration option' in ood_nginx_stage_check.stderr"
 
-    # --- Apps web de OOD que no se instalan -----------------------------
-    # Dos apps del paquete ondemand quedan FUERA a proposito:
+    # --- Apps web de OOD ------------------------------------------------
+    # sys/shell (ood-shell, role: shell, Node + node-pty) SE CONSERVA: es la
+    # Terminal nativa del portal. Historicamente moria con un fatal de V8
+    # ("Check failed: 12 == (*__errno_location ())") y se la borraba, pero la
+    # causa NO era Node ni Passenger: Ubuntu 26.04 endurecio apache2.service
+    # con MemoryDenyWriteExecute=yes, y esa restriccion seccomp (W^X) la
+    # heredan la PUN y el Node que Apache arranca. V8 no puede entonces marcar
+    # una pagina como ejecutable (mprotect PROT_EXEC) y aborta. Se desactiva
+    # esa capa solo en Apache (ver "Levantar MemoryDenyWriteExecute en Apache")
+    # y el Shell vuelve a funcionar, por eso ya no se elimina. El Node LTS 20
+    # de /opt fue un workaround del diagnostico equivocado (ver ood_shell_node
+    # en group_vars/all.yml).
     #
-    #   sys/shell  (ood-shell v1.1.2, role: shell, Node + node-pty)
-    #     Con Passenger 6.1.2 el spawn del proceso Node muere con un fatal de
-    #     V8, no con un error de modulo nativo:
-    #       Fatal error in , line 0
-    #       Check failed: 12 == (*__errno_location ())   # 12 = ENOMEM
-    #       v8::base::OS::SetPermissions(...)
-    #       v8::internal::Compiler::GenerateBaselineCode # JIT
-    #     Se descarto que fuera la version de Node: con Node 22 del sistema y
-    #     con un Node LTS 20.20.2 propio en /opt el fallo es IDENTICO, y la
-    #     misma app con el mismo Node corre 45s cuando se ejecuta a mano
-    #     (Error IDs: 335307dd, 31351df5, ec282460, f1c15bde).
-    #     Se descartaron tambien OOM killer, rlimits, cgroups, AppArmor,
-    #     monturas noexec y el propio node-pty.
-    #     La terminal del cluster la reemplaza la app sys/desktop (Xvnc+xterm
-    #     via noVNC), que no depende de Node.
+    # sys/desktop (Terminal Web) SE ELIMINA: era una terminal en el navegador
+    # (Xvnc + xterm + noVNC) que se habia agregado cuando el Shell nativo no
+    # arrancaba. Con el Shell andando es redundante, asi que el portal usa la
+    # Terminal nativa por defecto y se quita la app y toda su pila VNC (ver
+    # play 12, que ahora desinstala los paquetes en los nodos).
     #
-    #   sys/bc_desktop (role: batch_connect, template vnc de ood_core)
-    #     Ese template fue escrito para TurboVNC. Con TigerVNC 1.15 falla en
-    #     cuatro puntos verificados: 'vncserver -log' -> "Unrecognized option:
-    #     -Log"; espera 'pgrep -s 0 Xvnc' (el daemon sale de la sesion 0 y el
-    #     binario se llama Xtigervnc); y saca el display con awk '/^Desktop/'
-    #     cuando TigerVNC imprime "for display :N". Ademas invoca
-    #     'module purge' y arranca gnome/kde/mate, que no existen en el nodo.
-    #     sys/desktop cubre el mismo caso con template "basic" y codigo propio.
+    # sys/bc_desktop (role: batch_connect, template vnc de ood_core) SIGUE
+    # fuera. Ese template fue escrito para TurboVNC; con TigerVNC 1.15 falla en
+    # cuatro puntos verificados: 'vncserver -log' -> "Unrecognized option:
+    # -Log"; espera 'pgrep -s 0 Xvnc' (el daemon sale de la sesion 0 y el
+    # binario se llama Xtigervnc); y saca el display con awk '/^Desktop/'
+    # cuando TigerVNC imprime "for display :N". Ademas invoca 'module purge' y
+    # arranca gnome/kde/mate, que no existen en el nodo.
     #
-    # Se borran del arbol de apps, no solo se ocultan: si quedan, OOD las
-    # ofrece en el portal y el usuario las abre y vuelve a fallar.
-    - name: Eliminar apps web de OOD incompatibles con este cluster
+    # Las apps se borran del arbol (no se ocultan): si quedan, OOD las ofrece
+    # en el portal y el usuario las abre y vuelve a fallar.
+    - name: Eliminar apps web de OOD que ya no se usan
       ansible.builtin.file:
         path: "{{ ood_apps_root }}/sys/{{ item }}"
         state: absent
       loop:
-        - shell
         - bc_desktop
+        - desktop
+
+    - name: Comprobar si la app Shell original esta presente
+      # La app Shell la trae el paquete ondemand (no el repo). Una corrida
+      # vieja del playbook la borraba, asi que en nodos ya instalados hay que
+      # recuperarla reinstalando el paquete.
+      ansible.builtin.stat:
+        path: "{{ ood_apps_root }}/sys/shell"
+      register: ood_shell_app_stat
+
+    - name: Restaurar la app Shell original (reinstalar el paquete ondemand)
+      ansible.builtin.command:
+        cmd: apt-get install --reinstall -y ondemand
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+      when: not ood_shell_app_stat.stat.exists
 
     - name: Eliminar el Node LTS de la app Shell (ya no se usa)
       # Queda el arbol /opt/ood/node-20.20.2 de los despliegues anteriores.
@@ -1974,80 +1823,28 @@
         - "/tmp/node-v{{ ood_shell_node_version }}-linux-x64.tar.xz"
       when: ood_shell_node_prefix is defined
 
-    # --- Pila VNC en los NODOS DE COMPUTO ------------------------------
-    # La PUN (este host) solo proxea: el Xvnc, el websockify y el cliente
-    # noVNC corren DENTRO del job, o sea en los nodos de compute. Por eso el
-    # paquete se instala en 'compute' y no en 'ondemand' (arriba solo va el
-    # web root de noVNC, que se sirve desde este host).
-    #
-    # matchbox-window-manager + xterm dan una sesion grafica minima: sin
-    # escritorio completo (gnome/kde/mate) que serian cientos de MB por nodo.
-    # El objetivo es una terminal dentro del navegador, no un escritorio.
-    - name: Instalar la pila VNC y un escritorio minimo en los nodos de compute
-      # NO se puede delegate_to aca: 'ondemand' no incluye a los compute, asi
-      # que el delegate no encuentra el host y el play aborta. La pila VNC de
-      # los nodos se instala en su propio play mas abajo, con hosts: compute.
-      ansible.builtin.debug:
-        msg: "La pila VNC de compute se instala en el play 'VNC en nodos de computo'."
-      changed_when: false
+    # --- Limpieza de la pila VNC de la Terminal Web --------------------
+    # La app sys/desktop (Terminal Web) se elimino en favor de la Terminal
+    # nativa (arriba), asi que la pila VNC que la soportaba queda sin uso y se
+    # quita: en este host, noVNC + websockify y el wrapper /opt/websockify/run
+    # que el template vnc.rb de ood_core llamaba. OJO: el proxy /node y /rnode
+    # de ood_portal.yml NO se toca, porque lo siguen usando Jupyter, VS Code
+    # y MPI.
+    - name: Quitar el wrapper websockify de la PUN
+      ansible.builtin.file:
+        path: /opt/websockify
+        state: absent
 
-    # --- Pila VNC para las apps de escritorio remoto -------------------
-    # El template batch_connect "vnc" de ood_core (el que usa bc_desktop)
-    # necesita tres cosas que NO vienen con el paquete ondemand:
-    #   1) vncserver/Xvnc  -> levanta el display X
-    #   2) websockify       -> puente TCP<->WebSocket
-    #   3) noVNC            -> cliente web que abre la sesion en el navegador
-    # Sin esto la app se queda en "Starting" y nunca muestra el boton.
-    - name: Instalar noVNC y websockify en la PUN
-      # noVNC es el cliente web (se sirve como estatico) y websockify hace de
-      # puente. El servidor VNC real corre en el nodo de compute.
+    - name: Desinstalar noVNC y websockify de la PUN
+      # El paquete novnc 1.6.0 de la distro solo lo usaba el wrapper de la
+      # Terminal Web. El cliente noVNC 1.3.0 que trae el dashboard de OOD
+      # (public/noVNC-1.3.0) es un archivo del paquete ondemand y no se toca.
       ansible.builtin.apt:
         name:
           - novnc
           - websockify
-        state: present
-        update_cache: true
-
-    - name: Crear el directorio del wrapper websockify
-      # El template vnc.rb llama SIEMPRE a la ruta absoluta /opt/websockify/run
-      # (default de :websockify_cmd) y espera en el log la linea
-      # "proxying from :<puerto>". Un wrapper propio es lo que hace que el
-      # waiting del after_script termine en vez de agotar el timeout.
-      ansible.builtin.file:
-        path: /opt/websockify
-        state: directory
-        owner: root
-        group: root
-        mode: '0755'
-
-    - name: Desplegar el wrapper websockify con el web root de noVNC
-      # El paquete websockify de Ubuntu instala /usr/bin/websockify, pero SIN
-      # --web: sin ese flag no sirve el cliente noVNC y el navegador no tiene
-      # que cargar. Se pasa --web para que el mismo puerto sirva la sesion.
-      ansible.builtin.copy:
-        dest: /opt/websockify/run
-        owner: root
-        group: root
-        mode: '0755'
-        content: |
-          #!/bin/bash
-          # Generado por Ansible: NO editar a mano.
-          # Contrato con ood_core/batch_connect/templates/vnc.rb:
-          #   /opt/websockify/run <puerto_ws> localhost:<puerto_vnc>
-          exec /usr/bin/websockify --web /usr/share/novnc "$@"
-
-    - name: Verificar que el wrapper websockify levanta el puente
-      # El template vnc.rb hace polling del log buscando 'proxying from', asi
-      # que se prueba la cadena real: wrapper -> websockify -> novnc web root.
-      # websockify sigue escuchando en background esperando una conexion real,
-      # asi que la tarea tiene que cortarlo: 'timeout 3' mata el wrapper y
-      # devuelve el codigo 124, que no se mira porque el veredicto sale del
-      # stdout, no del exit status.
-      ansible.builtin.shell: |
-        timeout 3 /opt/websockify/run 19998 localhost:5900 2>&1 || true
-      register: ood_websockify_check
-      changed_when: false
-      failed_when: "'proxying from' not in ood_websockify_check.stdout"
+        state: absent
+        purge: true
 
     # --- Configuración de ood_portal.yml ---
     - name: Averiguar el nombre real de host de cada nodo de cómputo
@@ -2133,7 +1930,7 @@
           # comentada, node_proxy.lua no puede mapear REMOTE_USER a un usuario
           # de sistema, y devuelve 404 explicitamente desde Lua
           # ("failed to map user") en vez de rutear al nodo. Por eso los botones
-          # "Connect" de Jupyter / VS Code / Desktop dan 404 con la sesion
+          # "Connect" de Jupyter / VS Code / MPI dan 404 con la sesion
           # corriendo de fondo y Apache no loguea ningun error: no es un 404
           # de Apache sino un http404() del propio handler.
           # '.*' = el usuario de LDAP se usa tal cual como usuario de Unix.
@@ -2242,11 +2039,57 @@
         state: started
         enabled: true
 
+    # --- known_hosts global para la Terminal (app Shell) -----------------
+    # La Terminal corre como cada usuario LDAP y su SSH no tiene known_hosts
+    # propio. Sin un archivo GLOBAL, la primera conexion muestra:
+    #   hostkeys_find_by_key_hostfile: ... /etc/ssh/ssh_known_hosts: Permission denied
+    #   The authenticity of host '...' can't be established.
+    # Se pobla /etc/ssh/ssh_known_hosts con las claves de todos los nodos para
+    # que ningun usuario vea el prompt. Es global: no hay que tocar cada home.
+    - name: Recolectar las claves de host de los nodos del cluster
+      # ssh-keyscan no pide confirmacion y no depende de DNS inverso ni de
+      # facts de otros hosts. Se escanea por IP (ansible_host) y por los
+      # nombres del inventario y los hostnames reales de compute; lo que no
+      # resuelva se ignora (failed_when: false).
+      ansible.builtin.command:
+        cmd: "ssh-keyscan -T 5 {{ item }}"
+      loop: >-
+        {{ (((groups['master'] + groups['compute'] + groups['ondemand'])
+             | map('extract', hostvars, 'ansible_host') | list)
+            + (groups['master'] + groups['compute'] + groups['ondemand'])
+            + (ood_proxy_node_names | default([]))) | unique }}
+      register: ood_ssh_keyscan
+      changed_when: false
+      failed_when: false
+
+    - name: Verificar que se recolecto al menos una clave de host
+      ansible.builtin.assert:
+        that:
+          - (ood_ssh_keyscan.results | map(attribute='stdout') | select('ne', '') | list | length) > 0
+        fail_msg: >-
+          ssh-keyscan no devolvio ninguna clave de host: los nodos no responden
+          en el puerto 22 desde el nodo OOD.
+
+    - name: Publicar el known_hosts global del nodo OOD
+      ansible.builtin.copy:
+        dest: /etc/ssh/ssh_known_hosts
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          {% for line in ood_ssh_keyscan.results | map(attribute='stdout_lines') | flatten | select('match', '^[^#]') | unique %}
+          {{ line }}
+          {% endfor %}
+
   handlers:
     - name: Reiniciar apache
+      # daemon_reload: recarga las units antes de reiniciar. Sin esto el drop-in
+      # de MemoryDenyWriteExecute (que es un archivo de systemd nuevo) no se
+      # aplica hasta el proximo daemon-reload.
       ansible.builtin.systemd:
         name: apache2
         state: restarted
+        daemon_reload: true
 
 # ============================================================================
 # 9. Aprovisionar Prometheus en el master (es el que scrapea el cluster)
@@ -2729,9 +2572,9 @@
         state: restarted
 
 # ============================================================================
-# 11. Instalar Aplicaciones Interactivas en OOD (Jupyter y VS Code)
+# 11. Instalar Aplicaciones Interactivas en OOD (Jupyter, VS Code y MPI)
 # ============================================================================
-- name: "11. Instalar Aplicaciones Interactivas (Jupyter y VS Code)"
+- name: "11. Instalar Aplicaciones Interactivas (Jupyter, VS Code y MPI)"
   hosts: ondemand
   become: true
   tags: [interactive]
@@ -2790,62 +2633,27 @@
         state: restarted
 
 # ============================================================================
-# 12. Pila VNC en los nodos de computo (para la app Desktop de OOD)
+# 12. Limpieza de la pila VNC en los nodos de computo
 # ============================================================================
-# Es un play aparte y NO una tarea delegate_to del play 8 a proposito:
-# delegar a 'compute' desde un play que corre en 'ondemand' rompe el include
-# de hosts y aborta el play.
+# La app Desktop (Terminal Web) que usaba esta pila se elimino en favor de la
+# Terminal nativa del portal, asi que estos paquetes ya no se necesitan y se
+# desinstalan para no dejar dependencias inertes (cientos de MB por nodo).
 #
-# La app Desktop usa el template batch_connect "vnc" de ood_core, que dentro
-# del job de Slurm necesita:
-#   vncserver / Xvnc   -> el display X
-#   xterm              -> la terminal que se ve en el navegador
-#   matchbox           -> gestor de ventanas minimo, para que xterm se vea
-# Sin esto la sesion queda en "Starting" eterno: el vnc.rb no encuentra
-# 'vncserver', llama clean_up 1 y nunca genera connection.yml.
-#
-# Es un escritorio minimo a proposito, no gnome/kde/mate: el objetivo es una
-# terminal dentro del navegador y un DE completo son cientos de MB por nodo.
-- name: "12. Instalar la pila VNC en los nodos de computo"
+# Es un play aparte y NO una tarea delegate_to del play 8 a proposito: delegar
+# a 'compute' desde un play que corre en 'ondemand' rompe el include de hosts
+# y aborta el play.
+- name: "12. Quitar la pila VNC de los nodos de computo"
   hosts: compute
   become: true
   tags: [vnc, compute]
   tasks:
-    - name: Instalar el servidor VNC, xterm y el gestor de ventanas
+    - name: Desinstalar el servidor VNC, xterm y el gestor de ventanas
       ansible.builtin.apt:
         name:
           - tigervnc-standalone-server
           - xterm
           - matchbox-window-manager
-          # websockify va en el nodo, no en la PUN: el puente TCP<->WebSocket
-          # corre dentro del job de Slurm. El cliente noVNC lo sirve el
-          # dashboard de OOD (public/noVNC-1.3.0).
           - websockify
-        state: present
-        update_cache: true
-
-    - name: Verificar que los binarios de la sesion grafica quedaron disponibles
-      # Control explicito y por nombre: si un paquete cambia de layout, el
-      # assert falla aca con un mensaje claro en vez de dejar sesiones
-      # colgadas en Starting.
-      ansible.builtin.stat:
-        path: "{{ item }}"
-      loop:
-        - /usr/bin/Xvnc
-        - /usr/bin/vncpasswd
-        - /usr/bin/websockify
-        - /usr/bin/xterm
-        - /usr/bin/matchbox-window-manager
-      register: ood_vnc_binaries
-
-    - name: Fallar si falta algun binario de la sesion grafica
-      ansible.builtin.assert:
-        that: item.stat.exists
-        fail_msg: >-
-          {{ item.item }} no existe: la app Terminal Web no va a poder
-          levantar la sesion y todas las sesiones quedan en Starting.
-        success_msg: "{{ item.item }} disponible."
-      loop: "{{ ood_vnc_binaries.results }}"
-      loop_control:
-        label: "{{ item.item }}"
-      changed_when: false
+        state: absent
+        purge: true
+        autoremove: true

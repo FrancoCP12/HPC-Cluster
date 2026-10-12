@@ -247,7 +247,7 @@ El playbook es **idempotente**: ejecutarlo dos veces no duplica instalaciones ni
 | 6 | Apptainer | Llave GPG del PPA, repo `apptainer`, instala `apptainer`/`apptainer-suid`, bind de `/shared` |
 | 7 | Reconciliación | `wait_for` 6819, regenera `slurm.conf` en master, `scontrol reconfigure`, y `state=RESUME reason=""` (limpieza de DRAIN) |
 | — | LDAP | `slapd` con TLS (LDAPS), LDIF de árbol base, usuarios de prueba, SSSD en nodos |
-| — | Open OnDemand | Repo OOD 4.2.4, Apache + PUN, apps interactivas (Jupyter, VS Code, Terminal Web), Grafana con `auth.proxy` |
+| — | Open OnDemand | Repo OOD 4.2.4, Apache + PUN, Terminal nativa (Shell), apps interactivas (Jupyter, VS Code, MPI), Grafana con `auth.proxy` |
 | — | Grafana | `auth.proxy` vía cabecera `X-WEBAUTH-USER`, dashboard de clúster |
 | — | Prometheus | Node Exporter + Slurm exporter + timer de scrape |
 
@@ -261,74 +261,100 @@ Esta sección registra decisiones donde se eligió **no** arreglar algo, con el 
 y la consecuencia aceptada. Está para que nadie "lo arregle" sin saber que fue
 deliberado.
 
-### Cliente noVNC: se usa el 1.3.0 que trae OOD, no el 1.6.0 de la distro
+### Terminal Web interactiva: eliminada en favor del Shell nativo
 
-**Decisión.** La app `desktop` (Terminal Web) abre el noVNC **1.3.0** empaquetado
-dentro de la app `dashboard` de OOD:
+**Decisión.** Se elimina la app interactiva `sys/desktop` (**Terminal Web**, una
+terminal en el navegador con Xvnc + xterm + noVNC) y toda su pila de soporte:
+
+- en la PUN: los paquetes `novnc` y `websockify` y el wrapper `/opt/websockify/run`;
+- en los nodos de cómputo: `tigervnc-standalone-server`, `xterm`,
+  `matchbox-window-manager` y `websockify` (play 12, que ahora los desinstala).
+
+El portal queda con la **Terminal nativa** (`sys/shell`) por defecto.
+
+**Por qué.** La Terminal Web se agregó cuando el Shell nativo no arrancaba (el
+`MemoryDenyWriteExecute=yes` de Apache, ver la sección siguiente). Una vez
+resuelto eso la app era redundante: dos formas de hacer lo mismo, y la segunda
+arrastra cientos de MB de VNC en cada nodo.
+
+**Consecuencia.** Desaparece la opción "Terminal Web" del menú **Interactive
+Apps**; para una terminal se usa **Clusters → Shell Access** (la Terminal
+nativa). El proxy `/node` y `/rnode` de `ood_portal.yml` **no se toca**: lo
+siguen usando Jupyter, VS Code y MPI.
+
+### Terminal nativa (Shell): `MemoryDenyWriteExecute=no` en Apache
+
+**Decisión.** Se conserva la app `sys/shell` (la **Terminal** del portal) y se
+desactiva `MemoryDenyWriteExecute` **solo** en `apache2.service`, con un drop-in:
 
 ```
-/var/www/ood/apps/sys/dashboard/public/noVNC-1.3.0
+/etc/systemd/system/apache2.service.d/zz-memory.conf
+[Service]
+MemoryDenyWriteExecute=no
 ```
 
-No se migra al paquete `novnc` de la distro (1.6.0 en `/usr/share/novnc`).
+**Por qué.** El Shell es una app Node; V8 necesita marcar páginas de memoria como
+ejecutables (`mprotect`/`mmap` con `PROT_EXEC`) para su JIT. Ubuntu 26.04 endureció
+`apache2.service` con `MemoryDenyWriteExecute=yes` (política seccomp W^X). Esa
+restricción la **heredan todos los hijos de Apache**: la PUN que se arranca vía
+`sudo nginx_stage` y el Node que ésta lanza. Así, V8 aborta en cuanto compila su
+primer baseline:
 
-**Por qué.** Las dos versiones arman la URL del websocket de forma incompatible,
-y de eso depende toda la conexión:
+```
+# Fatal error in , line 0
+# Check failed: 12 == (*__errno_location ())    # 12 = ENOMEM
+  v8::base::OS::SetPermissions(...)
+  v8::internal::GenerateBaselineCode(...)        # JIT
+```
 
-| Versión | Cómo arma la URL | Resultado |
-|---|---|---|
-| 1.3.0 | `url = 'wss://' + host + '/' + path` (raíz) | `wss://host/rnode/work/4620/websockify` ✅ matchea `LocationMatch "^/rnode/..."` |
-| 1.6.0 | `url = new URL(path, location.href)` (relativo a la página) | `.../pun/sys/dashboard/noVNC-1.6.0/rnode/...` ❌ no matchea el vhost |
+Por eso el mismo binario con el mismo Node corría **bien a mano** (fuera de
+systemd no existe ese filtro) y **mal bajo Passenger** (que es hijo de Apache). No
+era un problema de versión de Node: ni el Node 22 del sistema ni un Node LTS 20
+aparte cambiaban nada. Apache no usa JIT, así que desactivar esa capa no le quita
+nada que necesite. Es el mismo workaround que necesita RHEL 10 (allí lo trae
+`httpd.service`).
 
-El proxy `/rnode/` está en la **raíz** del vhost OOD, y el path que produce 1.6.0
-cae debajo de `/pun/sys/dashboard/`, o sea que el websocket nunca se establecería.
+**Consecuencia.** Se relaja una capa de hardening de Apache (W^X). Se acepta: sin
+esto el Shell no arranca, y ningún otro proceso de Apache depende de esa
+restricción.
 
-**Consecuencia aceptada.** Si alguna vez se actualiza OOD y cambia el noVNC que
-trae el `dashboard`, la ruta deja de existir y el botón **Conectar** abre una
-pestaña con `404` — y lo hace **después** de que el job de Slurm ya arrancó,
-consumiendo recursos hasta que expire la sesión. Es un fallo tardío, no un
-fallo de arranque.
-
-**Probabilidad: baja.** OOD está pineado en `4.2.4` y el repo de `4.3` devuelve
-`404`, así que no se actualiza por accidente. Solo se dispara si alguien sube de
-versión a propósito.
-
-**Qué hacer si se activa el riesgo.**
+**Verificar.**
 
 ```bash
-# 1. Ver qué versión trae ahora el dashboard de OOD
-ls -d /var/www/ood/apps/sys/dashboard/public/noVNC-*
-
-# 2. Actualizar novnc_url en files/ood/apps/sys/desktop/view.html.erb.j2
-#    con esa versión y redesplegar:
-ansible-playbook playbook.yml --tags ood,interactive,vnc
+systemctl show apache2 -p MemoryDenyWriteExecute   # -> no
+# Al abrir Clusters -> Shell Access, el log del usuario NO debe mostrar el "Check failed: 12"
+sudo tail -n 50 /var/log/ondemand-nginx/<usuario>/error.log
 ```
 
-Para **migrar además** al 1.6.0 hacen falta tres cambios, no uno:
+### Terminal nativa (Shell): `ssh_known_hosts` global
 
-1. Servir `/usr/share/novnc` desde Apache (`Alias`/`Location`), porque hoy no lo
-   sirve nadie — el wrapper `/opt/websockify/run` lo usa con su `--web` interno,
-   no es un vhost.
-2. Cambiar `novnc_url` a la nueva ruta.
-3. **Poner el slash inicial en `ws_path`**: de `rnode/...` a `/rnode/...`.
+**Decisión.** Se publica `/etc/ssh/ssh_known_hosts` (propiedad `root:root`, modo
+`0644`) con las claves de host de **todos** los nodos del clúster, recolectadas
+con `ssh-keyscan` a las IPs (`ansible_host`), a los nombres del inventario y a
+los hostnames reales de cómputo.
 
-Los otros tres parámetros de la vista ya son compatibles con 1.6.0 y no hay que
-tocarlos:
+**Por qué.** La Terminal corre como **cada usuario LDAP** y su SSH no tiene un
+`known_hosts` propio. Al hacer `ssh <nodo>` por primera vez, el usuario veía:
 
-| Parámetro | 1.6.0 | Referencia |
-|---|---|---|
-| `autoconnect=true` | funciona (acepta `'true'` y `'1'`) | `app/ui.js:137` |
-| `resize=remote` | funciona (`resizeSession`) | `app/ui.js:1353` |
-| `#password=` | funciona (el fragment tiene precedencia) | `app/webutil.js:60` |
+```
+hostkeys_find_by_key_hostfile: hostkeys_foreach failed for /etc/ssh/ssh_known_hosts: Permission denied
+The authenticity of host '192.168.18.191' can't be established.
+```
 
-> ⚠️ Esta migración **no se puede validar sin navegador**: el síntoma (el ws no
-> conecta) solo aparece con una sesión de Slurm viva. Por eso queda documentada
-> y no aplicada.
+El archivo **no existía**. Como el prompt de autenticidad bloquea a un
+investigador y rompe scripts, se siembra un `known_hosts` **global** para todos
+los usuarios sin tocar cada `$HOME`. Se ignoran las líneas de comentario que
+emite `ssh-keyscan` y lo que no resuelva (nodos sin DNS) simplemente no aporta
+claves.
 
-**Nota.** El paquete `novnc` 1.6.0 **sí está instalado** en la PUN, pero lo
-consume el wrapper `/opt/websockify/run`, no esta app (que llama
-`/usr/bin/websockify` directo). Es decir: está disponible como ruta de migración
-si algún día se decide, pero hoy está inactivo.
+**Verificar.**
+
+```bash
+ls -l /etc/ssh/ssh_known_hosts            # -> -rw-r--r-- root root
+sudo -u <usuarioLDAP> -H ssh -o BatchMode=yes 192.168.18.191 true
+# NO debe aparecer "Host key verification failed" ni el prompt de autenticidad;
+# solo el normal "Permission denied (publickey,password)" si aún no hay clave.
+```
 
 ---
 
@@ -392,6 +418,122 @@ Con `detected_gpus > 0` se genera `gres.conf` (NVIDIA: `AutoDetect=nvml` con fal
 
 ---
 
+## MPI (OpenMPI) y jobs distribuidos
+
+El playbook instala **OpenMPI 5** (`openmpi-bin` + `libopenmpi-dev`) en **todos** los nodos
+(`mpi_packages` en `group_vars/all.yml`). Los programas MPI se compilan con `mpicc` y se
+lanzan con **`mpirun` dentro de una asignación de Slurm** (`sbatch`/`salloc`). El OpenMPI de
+Ubuntu viene compilado `--with-slurm` (trae `plm/slurm` + `ras/slurm`), así que `mpirun`
+detecta la asignación, arranca sus daemons con `srun` y reparte los ranks en los nodos
+asignados. **No hace falta SSH sin clave entre nodos.**
+
+```bash
+# 1. Compilar una vez, sobre el FS compartido (visible en todos los nodos)
+mpicc -O2 hello.c -o /shared/hello
+
+# 2. hello.sbatch  (se envía desde cualquier nodo con cliente Slurm)
+#!/bin/bash
+#SBATCH -N2            # 2 nodos
+#SBATCH -n2            # 2 ranks
+#SBATCH --chdir=/tmp   # OJO: el workdir debe EXISTIR en el nodo de cómputo (ver abajo)
+mpirun -np 2 /shared/hello
+```
+
+```bash
+sbatch hello.sbatch
+```
+
+Salida esperada (un rank por nodo):
+
+```
+rank 0/2 on work2
+rank 1/2 on workf
+```
+
+### Por qué `mpirun` y no `srun`
+
+`slurm.conf` deja `MpiDefault=none` **a propósito**. El build de Slurm **sí** trae los plugins
+`mpi/pmix*` y `mpi/pmi2`, pero:
+
+- `srun --mpi=pmix_v5`: con el `libpmix` de Ubuntu el server PMIx de `srun` se **cuelga**
+  (`Socket timed out on send/recv operation`) y deja el nodo en `COMPLETING`.
+- `srun --mpi=pmi2`: OpenMPI 5 **ya no** habla PMI-1/2.
+
+Por eso el camino soportado es OpenMPI puro (`mpirun` + `plm/slurm`). `MpiDefault` queda en
+`none` y no se usa `srun <app_mpi>` directo.
+
+### Nota sobre el WorkDir (importante)
+
+El directorio de trabajo del job (`--chdir`, o el dir desde el que se envía `sbatch`) tiene
+que **existir en el nodo de cómputo**, porque `slurmd` abre ahí el `stdout` del job. Los homes
+`/home/masterf`, `/home/workf`, `/home/work2` son **locales a cada nodo**, así que enviar un
+job desde el master sin `--chdir` falla con:
+
+```
+error: Could not open stdout file /home/masterf/slurm-N.out: No such file or directory
+_fork_all_tasks: IO setup failed: Slurmd could not connect IO   -> job muere con señal 53
+```
+
+Usá `--chdir=/tmp` / `--chdir=/shared/<dir>` o, para usuarios LDAP, el home compartido
+`/export/home/<user>`.
+
+### MPI desde Open OnDemand (app `MPI`)
+
+El portal trae una app **Interactive Apps → MPI (OpenMPI)** (código en
+`files/ood/apps/sys/mpi/`) que arma y envía el job MPI por vos. Elegís:
+
+- **Nodos** (1..cantidad de nodos `compute`, por defecto 2),
+- **Tasks por nodo** (por defecto 1; ver límite abajo),
+- **Programa MPI** (ruta absoluta; por defecto `/usr/bin/hostname`, que con 2 ranks
+  imprime el nombre de cada nodo — sirve para verificar el reparto sin compilar nada),
+- **Argumentos** (opcional),
+- y la duración.
+
+La app no expone un servicio web: su `template/script.sh.erb` corre
+`mpirun -np <nodos × tasks> <programa>` dentro del job. La salida del job queda en
+`output.log` y **se muestra en la propia tarjeta** (`info.html.erb`, que OOD renderiza
+como Markdown). Para el log completo, el **Session ID** de la tarjeta abre el directorio
+de la sesión en `Files`.
+
+Para correr un MPI propio, compilalo con `mpicc` sobre el FS compartido y poné esa ruta
+en el formulario:
+
+```bash
+cat > /shared/hello.c <<'EOF'
+#include <mpi.h>
+#include <stdio.h>
+int main(int argc, char **argv) {
+  int rank, size; char name[MPI_MAX_PROCESSOR_NAME]; int len;
+  MPI_Init(&argc, &argv);
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  MPI_Comm_size(MPI_COMM_WORLD, &size);
+  MPI_Get_processor_name(name, &len);
+  printf("rank %d/%d on %s\n", rank, size, name);
+  MPI_Finalize();
+  return 0;
+}
+EOF
+mpicc /shared/hello.c -o /shared/hello     # dejalo en /shared o en /export/home/<user>
+```
+
+Límite a tener en cuenta (el mismo que en las otras apps): `work2` tiene **1 CPU**, así
+que `Tasks por nodo = 1`. Pedir más deja el job en `PENDING` para siempre
+(`MinCPUsNode`). El máximo de nodos sale del grupo `compute` del inventario
+(`mpi_num_nodes_max` en `group_vars/all.yml`).
+
+> **Por qué `unset SLURM_EXPORT_ENV` en `template/script.sh.erb` (no lo borres).**
+> OOD envía el job con `--export=NONE` (default de `ood_core`), así que el job hereda
+> `SLURM_EXPORT_ENV=NONE`. El `srun` que `mpirun` (PRRTE, componente `plm:slurm`) lanza
+> para arrancar el daemon `prted` hereda ese modo y lo ejecuta con un entorno **vacío**
+> (sin `PATH`); `slurmstepd` hace `execve("prted")` y falla:
+> `slurmstepd: error: execve(): prted: No such file or directory` → `srun-failed`
+> (PRRTE sólo muestra *"You were supposed to get help about: srun-failed"*, sin la causa
+> real). Haciendo `unset SLURM_EXPORT_ENV` el `srun` interno exporta el entorno del job
+> (que **sí** trae `PATH`) al step y `prted` arranca. Sin ese `unset` la app compila y
+> envía el job pero éste muere al instante.
+
+---
+
 ## Seguridad
 
 - **Secretos en texto plano**: `group_vars/all.yml` contiene contraseñas reales sin cifrar. Es una decisión consciente para este laboratorio; ver sección 2. El repo debe quedar en un remoto privado.
@@ -416,6 +558,7 @@ Con `detected_gpus > 0` se genera `gres.conf` (NVIDIA: `AutoDetect=nvml` con fal
 | `gres.conf`: `unsupported operand type(s) for -: 'AnsibleUnsafeText' and 'int'` | Expresión Jinja evaluada en línea comentada | Ya corregido: comentarios `{# ... #}` nativos de Jinja + casteo `(detected_gpus | int) - 1`. |
 | GPU detectadas pero `sinfo` muestra `gres=(null)` | `slurmctld` sin reconfigurar | `scontrol reconfigure` (el play lo hace; manual: reintentar). |
 | Mount NFS cuelga el boot | NFS no disponible al arrancar | `_netdev` en fstab ya añadido; verificar orden de arranque con `systemctl status nfs-client.target`. |
+| App MPI en OOD: job `Completed`/`FAILED` al instante con *"Sorry! You were supposed to get help about: srun-failed"* | OOD envía con `--export=NONE` → `SLURM_EXPORT_ENV=NONE` → el `srun` interno de PRRTE lanza `prted` con entorno vacío | Ya corregido en `template/script.sh.erb` con `unset SLURM_EXPORT_ENV`. Para ver la causa real (`execve(): prted: No such file or directory`) correr `mpirun` con `OMPI_MCA_plm_base_verbose=100`. |
 
 ---
 

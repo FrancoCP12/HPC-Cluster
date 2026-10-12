@@ -128,6 +128,23 @@ slurm_packages_dir: packages
 slurm_deb_patterns:
   - "slurm-smd_*.deb"
 
+# ----- MPI distribuido (OpenMPI) -----
+# OpenMPI 5 del repo de Ubuntu 26.04. Los jobs MPI se lanzan con `mpirun`
+# DENTRO de una asignación de Slurm (sbatch/salloc), no con `srun`.
+#
+# El binario de Ubuntu viene compilado `--with-slurm` y trae plm/slurm + ras/slurm,
+# así que mpirun detecta la asignación, arranca sus daemons de una con `srun` y
+# reparte los ranks en los nodos asignados. NO necesita SSH sin clave entre nodos.
+#
+# Por qué NO se usa `srun --mpi=pmix_v5` ni MpiDefault=pmix: el build de Slurm SÍ
+# trae los plugins mpi/pmix* y mpi/pmi2, pero con el libpmix de Ubuntu el server
+# PMIx de srun se cuelga ("Socket timed out on send/recv operation") y deja el nodo
+# en COMPLETING; `--mpi=pmi2` tampoco sirve porque OpenMPI 5 ya no habla PMI-1/2.
+# Por eso slurm.conf mantiene MpiDefault=none y el camino soportado es mpirun.
+mpi_packages:
+  - openmpi-bin
+  - libopenmpi-dev
+
 #LDAP 
 
 ldap_domain: "utn.edu.ar"
@@ -201,6 +218,16 @@ interactive_num_cores_default: 1
 interactive_num_cores_max: 1
 interactive_memory_default_mb: 1024
 interactive_memory_max_mb: 1024
+
+# Recursos de la app MPI (files/ood/apps/sys/mpi). El maximo de nodos sale del
+# grupo 'compute' del inventario para no quedar desactualizado al agregar o
+# quitar workers. 'tasks por nodo' queda en 1 a proposito: work2 tiene CPUTot=1
+# y pedir mas por nodo deja el job en PENDING (MinCPUsNode) para siempre. Subirlo
+# solo si TODOS los nodos tienen CPUs de sobra.
+mpi_num_nodes_default: "{{ [2, (groups['compute'] | default([]) | length)] | min }}"
+mpi_num_nodes_max: "{{ groups['compute'] | default([]) | length }}"
+mpi_ntasks_per_node_default: 1
+mpi_ntasks_per_node_max: 1
 
 # ----- Open OnDemand --------------------------------------------------------
 # Regex de hosts a los que el reverse proxy de OOD puede conectarse. El proxy
@@ -308,44 +335,47 @@ ood_interactive_apps:
   - app: codeserver
     src: template/after.sh.erb.j2
     dest: template/after.sh.erb
-  # Terminal en el navegador: Xvnc + xterm en el nodo, noVNC como cliente.
-  # Reemplaza a sys/shell, que con Passenger 6.1.2 + Node 22/20 muere con un
-  # fatal de V8 en el JIT antes de levantar la terminal.
-  - app: desktop
+  # App MPI: corre mpirun dentro de una asignacion de Slurm. No expone un
+  # servidor web, por eso ademas de view.html.erb (estado "running") trae
+  # info.html.erb, que muestra la salida del job (output.log) en la tarjeta.
+  - app: mpi
     src: manifest.yml.j2
     dest: manifest.yml
-  - app: desktop
+  - app: mpi
     src: form.yml.j2
     dest: form.yml
-  - app: desktop
+  - app: mpi
     src: submit.yml.erb.j2
     dest: submit.yml.erb
-  - app: desktop
+  - app: mpi
     src: view.html.erb.j2
     dest: view.html.erb
-  - app: desktop
+  - app: mpi
+    src: info.html.erb.j2
+    dest: info.html.erb
+  - app: mpi
     src: template/before.sh.erb.j2
     dest: template/before.sh.erb
-  - app: desktop
+  - app: mpi
     src: template/script.sh.erb.j2
     dest: template/script.sh.erb
     # 0755 por lo mismo que jupyter/codeserver: lo ejecuta el job script.
     mode: "0755"
+  - app: mpi
+    src: template/after.sh.erb.j2
+    dest: template/after.sh.erb
 
-# Node LTS con el que se arregla la app web Shell (ood-shell).
+# Node LTS que se usaba para la app web Shell (ood-shell).
 #
-# No se usa el Node del sistema (/usr/bin/node, NodeSource v22) porque con el
-# spawn de Passenger 6.1.2 el proceso muere con un fatal de V8 por ENOMEM
-# durante el JIT ("Check failed: 12 == (*__errno_location())"). La app corre
-# bien con el mismo Node fuera de Passenger, asi que el problema es la
-# combinacion Passenger + Node 22, no la app.
-#
-# Se instala en un prefijo propio y NO se reemplaza el Node del sistema: este
-# nodo aloja el portal, Grafana y el clúster, y otras apps pueden depender del
-# Node que ya esta.
-#
-# Version y checksum salen de nodejs.org oficial. La 20.20.2 es la ultima 20.x
-# ("Iron"). Para actualizar hay que cambiar las TRES cosas juntas.
+# OJO: esto fue un workaround de un DIAGNOSTICO EQUIVOCADO. El Shell moria con
+# un fatal de V8 ("Check failed: 12 == (*__errno_location())") y se creyo que
+# era Passenger + Node 22, asi que se instalo un Node 20 propio. La causa real
+# era otra: Ubuntu 26.04 trae MemoryDenyWriteExecute=yes en apache2.service, y
+# esa restriccion seccomp W^X la heredan la PUN y el Node que Apache arranca,
+# asi que V8 no puede marcar memoria como ejecutable. Se resuelve con el
+# drop-in /etc/systemd/system/apache2.service.d/zz-memory.conf que escribe el
+# playbook (ver README y playbook.yml). Con eso el Shell corre con el Node del
+# sistema y este Node aparte ya no hace falta; el play lo elimina.
 ood_shell_node_version: "20.20.2"
 ood_shell_node_sha256: "df770b2a6f130ed8627c9782c988fda9669fa23898329a61a871e32f965e007d"
 ood_shell_node_prefix: "/opt/ood/node-{{ ood_shell_node_version }}"

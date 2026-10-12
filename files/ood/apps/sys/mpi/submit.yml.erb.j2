@@ -1,0 +1,47 @@
+---
+# Template "basic" de ood_core: la app NO levanta un servidor web, asi que no
+# hay puerto que proxear ni connection view real. El job corre mpirun, escribe a
+# output.log y termina.
+batch_connect:
+  template: "basic"
+
+<%-
+  # ---------------------------------------------------------------------------
+  # Validacion del formulario.
+  #
+  # Esto se evalua al enviar la sesion (bindings = atributos del form). Si algo
+  # falla, un 'raise' aborta el submit y el dashboard muestra el mensaje: nunca
+  # se llega a encolar un job invalido.
+  #
+  # Los valores se interpolan despues dentro de script.sh.erb, asi que se
+  # limitan a un charset seguro (sin ; | & $ ` < > " ni comillas) para que no
+  # puedan inyectar comandos.
+  # ---------------------------------------------------------------------------
+  program = mpi_program.to_s.strip
+  args    = mpi_args.to_s.strip
+  nodes   = mpi_num_nodes.to_i
+  tpn     = mpi_ntasks_per_node.to_i
+
+  raise "El 'Programa MPI' no puede estar vacio." if program.empty?
+  raise "El 'Programa MPI' debe ser una ruta absoluta (empezar con /)." unless program.start_with?("/")
+  raise "La ruta del programa solo admite letras, numeros y . _ - / +" unless program =~ %r{\A[A-Za-z0-9_./+-]+\z}
+  raise "'Nodos' debe ser 1 o mas." if nodes < 1
+  raise "'Tasks por nodo' debe ser 1 o mas." if tpn < 1
+  unless args.empty?
+    raise "Los argumentos solo admiten letras, numeros y . _ - / = : , @ % + (separados por espacios)." unless args =~ %r{\A[A-Za-z0-9_./=,:@%+-]+(\s+[A-Za-z0-9_./=,:@%+-]+)*\z}
+  end
+-%>
+
+script:
+  native:
+    # La particion tiene que existir en slurm.conf (ver slurm_partition_name).
+    - "--partition"
+    - "{{ slurm_partition_name }}"
+    # -N = cantidad de NODOS; --ntasks-per-node = tasks por nodo. El total de
+    # ranks de mpirun es nodos x tasks-per-node.
+    - "-N"
+    - "<%= nodes %>"
+    - "--ntasks-per-node"
+    - "<%= tpn %>"
+    - "-t"
+    - "<%= bc_num_hours %>"

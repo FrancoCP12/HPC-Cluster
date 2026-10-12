@@ -1,0 +1,43 @@
+<%-
+  # ---------------------------------------------------------------------------
+  # Vista de informacion de la tarjeta ("custom_info_view" del dashboard).
+  #
+  # OOD la renderiza con 'binding' = la BatchConnect::Session, o sea que 'self'
+  # es la sesion: se pueden llamar sus metodos (staged_root, id, completed?, ...)
+  # y cualquier metodo de Kernel (File, ...). El resultado se pasa por Markdown,
+  # asi que la salida va en un bloque de codigo con ```.
+  #
+  # Se muestra SIEMPRE (encolada, corriendo o terminada), no solo al completar:
+  # asi el usuario ve la salida crecer mientras el job corre.
+  #
+  # staged_root = ~/ondemand/data/sys/dashboard/batch_connect/sys/mpi/output/<uuid>
+  # y OOD redirige el stdout/stderr del job a staged_root/output.log.
+  # ---------------------------------------------------------------------------
+  log_path  = staged_root.join("output.log")
+  max_bytes = 64 * 1024            # tope para no volcar un log gigante a la tarjeta
+  body      = nil
+
+  if log_path.exist? && log_path.size.positive?
+    size = log_path.size
+    raw  = if size > max_bytes
+             File.open(log_path, "rb") { |f| f.seek(size - max_bytes); f.read }
+           else
+             log_path.read
+           end
+    raw  = raw.force_encoding("UTF-8")
+    raw  = raw.valid_encoding? ? raw : raw.scrub("?")
+    body = raw
+    body = "...[salida truncada: se muestran los ultimos #{max_bytes} bytes]...\n" + body if size > max_bytes
+  end
+-%>
+<% if body -%>
+### Salida de MPI
+
+```
+<%= body %>
+```
+<% else -%>
+### Salida de MPI
+
+Todavía no hay salida: el job está encolado o arrancando. Recargá la página en unos segundos.
+<% end -%>

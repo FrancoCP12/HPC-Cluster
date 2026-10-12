@@ -15,10 +15,15 @@ StateSaveLocation=/var/spool/slurmctld
 SlurmdSpoolDir=/var/spool/slurmd
 SwitchType=switch/none
 MpiDefault=none
-# Sin --with-pmix: los .deb de packages/ubuntu26/ se compilaron sin soporte
-# PMIx, asi que no existe ningun plugin mpi/pmix* en PluginDir. Poner
-# MpiDefault=pmix o pmix_v5 aca cuelga todo srun, incluso en serie.
+# MpiDefault=none a proposito: los jobs MPI se lanzan con `mpirun` (OpenMPI),
+# no con `srun`. El OpenMPI 5 de Ubuntu 26.04 viene compilado --with-slurm, asi
+# que mpirun detecta la asignacion y arranca los ranks en los nodos asignados.
 #
+# El build de Slurm SI trae los plugins mpi/pmix*, mpi/pmix_v5 y mpi/pmi2, pero
+# `srun --mpi=pmix_v5` se cuelga con el libpmix de Ubuntu ("Socket timed out on
+# send/recv operation") y deja el nodo en COMPLETING, y `--mpi=pmi2` no sirve
+# porque OpenMPI 5 ya no habla PMI-1/2. Por eso MpiDefault queda en none y el
+# camino soportado para MPI es `mpirun` dentro de sbatch/salloc.
 # Sin esto slurmctld arranca pero avisa "Configured MailProg is invalid": el
 # default de Slurm es /bin/mail y en Ubuntu 26.04 no existe (tampoco sendmail).
 MailProg=/bin/true

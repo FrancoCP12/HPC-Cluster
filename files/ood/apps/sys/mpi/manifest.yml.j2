@@ -1,0 +1,10 @@
+---
+name: MPI (OpenMPI)
+description: |
+  Ejecuta un programa MPI con mpirun sobre una asignación de Slurm.
+  Elegís cuántos nodos y cuántas tasks por nodo; el job lanza mpirun y deja la
+  salida en la propia tarjeta de la sesión.
+category: Interactive Apps
+subcategory: Servers
+role: batch_connect
+cluster: "{{ slurm_cluster_name }}"

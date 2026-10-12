@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# Script principal del job. OOD lo forkear con "&", o sea que corre en
+# background mientras el resto del job_script_content.sh sigue (after.sh,
+# create_yml, wait). Su stdout/stderr va a staged_root/output.log.
+#
+# OJO con el contexto: los template/*.erb se renderizan con el binding
+# TemplateBinding, que solo expone 'session' y 'context'. Los valores del
+# formulario se leen como context.<id> (SessionContext los resuelve por
+# method_missing). Referenciarlos como variable suelta (mpi_num_nodes) da
+# NameError.
+<%
+  program = context.mpi_program.to_s.strip
+  args    = context.mpi_args.to_s.strip
+  nodes   = context.mpi_num_nodes.to_i
+  tpn     = context.mpi_ntasks_per_node.to_i
+  total   = nodes * tpn
+-%>
+TOTAL_RANKS=<%= total %>
+PROGRAM="<%= program %>"
+ARGS="<%= args %>"
+
+echo "MPI: lanzando ${TOTAL_RANKS} rank(s) de ${PROGRAM}"
+
+# --- Fix imprescindible: SLURM_EXPORT_ENV ---
+# OOD submitea el job con "--export=NONE" (es su default en ood_core), asi que
+# el job hereda SLURM_EXPORT_ENV=NONE. El srun que mpirun (PRRTE plm:slurm)
+# lanza internamente para arrancar el daemon 'prted' hereda ese modo y ejecuta
+# prted con un entorno VACIO (sin PATH); slurmstepd hace execve("prted") y falla:
+#   slurmstepd: error: execve(): prted: No such file or directory
+#   -> srun-failed  -> "Sorry! You were supposed to get help about: srun-failed"
+# Quitando la variable, el srun interno exporta el entorno del job (que SI trae
+# PATH) al step, y prted se encuentra. No tiene otros efectos: la variable solo
+# refleja el modo de export y mpirun la reescribe para su propio step.
+unset SLURM_EXPORT_ENV
+
+# mpirun de OpenMPI (build --with-slurm) detecta solo la asignacion via el PLM
+# 'slurm': NO necesita SSH sin clave entre nodos ni -hostfile/--host. Cada rank
+# arranca en un slot de la asignacion pedida con -N/--ntasks-per-node.
+#
+# 'exec' reemplaza a este shell por mpirun: su exit code es el del job, y el
+# 'wait ${SCRIPT_PID}' del job script lo espera igual.
+if [ -n "${ARGS}" ]; then
+  exec mpirun -np "${TOTAL_RANKS}" "${PROGRAM}" ${ARGS}
+else
+  exec mpirun -np "${TOTAL_RANKS}" "${PROGRAM}"
+fi

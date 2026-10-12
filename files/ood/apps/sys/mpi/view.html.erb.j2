@@ -1,0 +1,22 @@
+<%-
+  # Vista de conexion que muestra el dashboard MIENTRAS la sesion esta Running.
+  #
+  # Se renderiza con binding = 'connect' (el OpenStruct de connection.yml), por
+  # eso solo se pueden nombrar sus miembros (host, port, password). 'host' es el
+  # nodo de calculo donde cayo el job.
+  #
+  # Esta app no expone ningun servicio: no hay boton "Connect". El valor de esta
+  # vista es explicar donde ver la salida y evitar el cartel generico de
+  # "missing connection".
+-%>
+<p>
+  El job MPI está corriendo en el nodo <strong><%= host %></strong>.
+  La salida de <code>mpirun</code> aparece arriba, en esta misma tarjeta, y se
+  actualiza al recargar la página. Cuando el programa termina, la sesión pasa a
+  <em>Completed</em> y la salida queda fija.
+</p>
+<p class="help-block">
+  Para ver el <code>output.log</code> crudo y completo: hacé clic en el
+  <strong>Session ID</strong> de esta tarjeta, que abre el directorio de la
+  sesión en <em>Files</em>.
+</p>

@@ -1,0 +1,7 @@
+# Corre DENTRO del job de Slurm (nodo de calculo), justo antes de forkear
+# script.sh. Lo sourcea el job_script_content.sh que arma OOD.
+#
+# Esta app no expone ningun servidor, asi que aca no hay puerto ni password que
+# preparar (a diferencia de jupyter/codeserver). Solo dejamos un banner con la
+# asignacion, que queda al principio de output.log.
+echo "MPI: nodo ${host} - asignacion ${SLURM_JOB_NODELIST:-?}"
