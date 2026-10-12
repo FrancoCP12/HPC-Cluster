@@ -1466,6 +1466,21 @@
         deb: /tmp/ondemand-release-web_4.2.0-resolute_all.deb
         state: present
 
+    - name: Detectar listas de paquetes corruptas del repo OOD (0 bytes)
+      ansible.builtin.find:
+        paths: /var/lib/apt/lists
+        patterns:
+          - "apt.osc.edu_*"
+        size: 0
+      register: ood_corrupt_lists
+
+    - name: Limpiar listas de paquetes corruptas del repo OOD
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ ood_corrupt_lists.files }}"
+      when: ood_corrupt_lists.files | length > 0
+
     - name: Instalar OOD, Apache y dependencias de criptografía
       ansible.builtin.apt:
         name:

@@ -10,7 +10,7 @@
 
 #SBATCH --job-name=mpi_omp
 #SBATCH --partition=general
-#SBATCH -N 2                  # ← NODOS (cuantos nodos de computo)
+#SBATCH -N 1                  # ← NODOS (cuantos nodos de computo)
 #SBATCH --ntasks=2            # ← RANKS totales (1 proceso MPI por core)
 #SBATCH --cpus-per-task=1     # ← CORES por rank
 #SBATCH -t 01:00:00           # ← duracion maxima (HH:MM:SS)
