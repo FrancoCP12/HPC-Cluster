@@ -1411,7 +1411,7 @@
       ansible.builtin.shell: |
         set -uo pipefail
         rc=0
-        for n in {{ groups['compute'] | map('extract', hostvars, 'inventory_hostname_short') | join(' ') }}; do
+        for n in {{ groups['compute'] | map('extract', hostvars, 'ansible_hostname') | join(' ') }}; do
           state=$(timeout 30 scontrol show node "$n" 2>/dev/null \
                   | grep -oE '(^|[[:space:]])(Node)?State=[^[:space:]]+' \
                   | head -1 | cut -d= -f2)
