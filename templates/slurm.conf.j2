@@ -13,6 +13,12 @@ AccountingStorageType=accounting_storage/slurmdbd
 AccountingStorageHost={{ slurm_db_host }}
 AccountingStoragePort={{ slurmdbd_port }}
 AccountingStorageUser={{ slurm_db_user }}
+{% if slurm_enforce_associations | default(false) | bool %}
+# Exigir asociacion en SlurmDBD: Slurm RECHAZA los jobs de usuarios sin
+# cuenta/asociacion. Solo se activa cuando todos los usuarios del portal
+# tienen su asociacion creada.
+AccountingStorageEnforceAssociations=associations
+{% endif %}
 JobAcctGatherType=jobacct_gather/cgroup
 JobAcctGatherFrequency=30
 # Default memory per CPU for jobs without --mem
@@ -21,6 +27,13 @@ DefMemPerCPU=1024
 # Procesos, Scheduling y Recursos Genéricos (GRES / GPU)
 SlurmctldPidFile=/run/slurm/slurmctld.pid
 SlurmdPidFile=/run/slurm/slurmd.pid
+# StateSaveLocation NO se puede omitir: el default compilado de slurmctld es
+# /var/spool (propiedad de root), y al arrancar aborta con
+#   "fatal: Incorrect permissions on state save loc: /var/spool"
+# porque el User=slurm de la unit no puede escribir ahi. Hay que apuntarlo al
+# directorio que el playbook crea y cede a slurm (/var/spool/slurmctld).
+StateSaveLocation=/var/spool/slurmctld
+SlurmdSpoolDir=/var/spool/slurmd
 ProctrackType=proctrack/cgroup
 TaskPlugin=task/cgroup
 GresTypes=gpu
@@ -28,15 +41,17 @@ SelectType=select/cons_tres
 SelectTypeParameters=CR_Core_Memory
 ReturnToService=1
 
-# Definición Dinámica de Nodos de Cómputo (hardcoded safe defaults)
+# Definición Dinámica de Nodos de Cómputo.
+# CPUs, RealMemory y GPUs se detectan por nodo desde sus facts; el inventory
+# puede pisar CPUs/RealMemory con slurm_cpus / slurm_real_memory_mb.
 {% for node in groups['compute'] %}
 {% set node_host = hostvars[node]['ansible_hostname'] | default(node) %}
 {% set node_ip = hostvars[node]['ansible_host'] | default(hostvars[node]['ansible_default_ipv4']['address'] | default(node)) %}
-{% if node == 'worker1' or node_host == 'worker1' or node_host == 'workf' %}
-NodeName={{ node_host }} NodeAddr={{ node_ip }} CPUs=3 RealMemory=9261{% if gpus is defined and gpus > 0 %} Gres=gpu:{{ gpus }}{% endif %} Feature={{ hostvars[node]['node_feature'] | default('standperf') }} State=UNKNOWN
-{% else %}
-NodeName={{ node_host }} NodeAddr={{ node_ip }} CPUs=3 RealMemory=9261{% if gpus is defined and gpus > 0 %} Gres=gpu:{{ gpus }}{% endif %} Feature={{ hostvars[node]['node_feature'] | default('standperf') }} State=UNKNOWN
-{% endif %}
+{% set node_cpus = hostvars[node]['slurm_cpus'] | default(hostvars[node]['ansible_processor_vcpus'] | default(hostvars[node]['ansible_processor_cores'] | default(1))) %}
+{% set node_memtotal = hostvars[node]['ansible_memtotal_mb'] | default(0) | int %}
+{% set node_mem = hostvars[node]['slurm_real_memory_mb'] | default((node_memtotal - (slurm_node_memory_reserve_mb | default(0) | int)) if node_memtotal > 0 else 1024) %}
+{% set node_gpus = hostvars[node]['detected_gpus'] | default(0) | int %}
+NodeName={{ node_host }} NodeAddr={{ node_ip }} CPUs={{ node_cpus }} RealMemory={{ node_mem }}{% if node_gpus > 0 %} Gres=gpu:{{ node_gpus }}{% endif %} Feature={{ hostvars[node]['node_feature'] | default('standperf') }} State=UNKNOWN
 {% endfor %}
 
 # Definición de Partición

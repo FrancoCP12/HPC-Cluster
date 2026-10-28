@@ -14,6 +14,19 @@
 # ----- Identidad del clúster -----
 slurm_cluster_name: clusterUTN          # SlurmClusterName (DBD + slurm.conf + sacctmgr)
 slurm_version: "24.11.7"                # Versión de los paquetes .deb desplegados
+slurm_conf_path: /etc/slurm/slurm.conf  # Configuracion de Slurm (ctld, slurmd, scontrol)
+
+# ----- Recursos de los nodos de cómputo (detección automática) -----
+# slurm.conf NO hardcodea CPUs ni RealMemory: el template los deriva de los
+# facts de cada nodo (ansible_processor_vcpus y ansible_memtotal_mb), así que
+# agregar/cambiar nodos no requiere editar la config a mano.
+#
+# A RealMemory se le resta esta reserva para el SO y el propio slurmd, así Slurm
+# nunca intenta repartir toda la RAM física. Se calcula por nodo en el template.
+#
+# Overrides opcionales por host (van en el inventory): slurm_cpus y
+# slurm_real_memory_mb pisan el valor detectado para un nodo puntual.
+slurm_node_memory_reserve_mb: 1024
 
 # ----- Usuario / grupo del servicio -----
 slurm_user: slurm
@@ -36,6 +49,32 @@ slurm_db_port: 3306
 mysql_innodb_buffer_pool_mb: "{{ ((hostvars[groups['database'][0]]['ansible_memtotal_mb'] | default(2048)) * 0.25) | int }}"
 mysql_innodb_lock_wait_timeout: 3600
 slurmdbd_port: 6819                     # Puerto del demonio SlurmDBD
+
+# ----- Accounting: cuentas y asociaciones de los usuarios del portal -------
+# Usuarios que se autentican contra LDAP y entran por Open OnDemand. Cada uno
+# necesita una CUENTA y una ASOCIACION en SlurmDBD: sin asociacion, Slurm
+# acepta el job pero lo reporta con Account=(null) (el accounting no le puede
+# atribuir el consumo a nadie) y las cuotas por usuario no existen.
+#
+# Se usa el mismo origen de verdad que el LDAP del playbook, asi la lista no
+# se desincroniza con los usuarios que realmente pueden entrar al portal.
+slurm_accounting_users:
+  - "{{ ldap_test_user }}"      # admin
+  - "{{ ldap_second_user }}"    # alumno1
+
+# Control del cluster que se REGISTRA en SlurmDBD. SlurmDBD guarda el nombre
+# del cluster con mayusculas/minusculas EXACTAS: si slurm.conf dice
+# "clusterUTN" y la tabla de la DB tiene "clusterutn", el INSERT del registro
+# de cada job viola la FK y el accounting se pierde en silencio (sacct no
+# muestra nada). Por eso el playbook registra el cluster con el MISMO nombre
+# que usa slurm.conf (slurm_cluster_name).
+slurm_control_host: "127.0.0.1"
+slurm_control_port: 6817
+
+# Si se pone en true, slurm.conf exige AccountingStorageEnforceAssociations y
+# Slurm RECHAZA los jobs de usuarios sin asociacion. Solo se activa cuando
+# TODOS los usuarios del portal tienen asociacion creada.
+slurm_enforce_associations: false
 # slurmrestd NO puede correr como root, como SlurmUser ni con el grupo de
 # SlurmUser: aborta con "should not be run as the root user", "should not be run
 # as SlurmUser" y "should not be run with SlurmUser's group". Por eso tiene
@@ -82,7 +121,15 @@ shared_home_root: /export/home
 # Redes autorizadas a montar las exportaciones NFS del master. Restringir el
 # export a la red del clúster evita exponer los homes compartidos a cualquier
 # host de la LAN.
-nfs_export_networks: "192.168.18.0/24"
+#
+# Es una LISTA: cada red se exporta con sus propias opciones, porque exportfs
+# exige host(opciones) por cada entrada. Se mantienen ambas para que el clúster
+# funcione tanto por Tailscale (100.64.0.0/10, rango CGNAT: cubre 100.104/100.105/
+# 100.125) como por la LAN real. Si se deja de usar Tailscale, basta con borrar
+# esa línea y el template sigue generando /etc/exports válido.
+nfs_export_networks:
+  - 100.64.0.0/10      # Tailscale (rango CGNAT)
+  - 192.168.1.0/24     # LAN real
 
 # Clientes autorizados a gestionar los homes SIN squash. El nodo Open OnDemand
 # necesitaprivilegios root reales sobre el share: nginx_stage corre
@@ -204,20 +251,36 @@ home_skel_dir: /etc/skel
 # que no existe hace que sbatch falle al submitsar y el usuario nunca ve el job.
 slurm_partition_name: general
 
-# Recursos que piden las apps interactivas (Jupyter / code-server) por defecto.
+# Recursos que pueden pedir las apps interactivas (Jupyter / code-server).
 #
-# IMPORTANTE: tienen que entrar en el nodo de calculo. work2 tiene CPUTot=1 y
-# RealMemory=1477 MiB, asi que con los valores previos (2 cores / 4096 MiB)
-# sbatch enviaba el job y Slurm lo dejaba en PENDING para siempre con
-# Reason=PartitionConfig (MinCPUsNode=2 contra un nodo de 1 CPU). El portal
-# mostraba "Your session is currently starting..." indefinidamente y al vencer
-# la sesion aparecia "this card will be retained for 6 more days": la app nunca
-# arrancaba. El maximo tambien se limita para que el usuario no pueda pedir mas
-# de lo que existe y volver a caer en la misma espera eternal.
-interactive_num_cores_default: 1
-interactive_num_cores_max: 1
-interactive_memory_default_mb: 1024
-interactive_memory_max_mb: 1024
+# Son GENERICOS: el maximo de cores y de RAM se detecta del nodo de computo mas
+# grande via facts (ansible_processor_vcpus / ansible_memtotal_mb), restando la
+# misma reserva que usa slurm.conf. Asi no quedan numeros hardcodeados que se
+# vuelven obsoletos al cambiar el hardware. Antes eran 2 cores / 4096 MiB contra
+# work2 (1 CPU / 1477 MiB): sbatch mandaba el job y Slurm lo dejaba en PENDING
+# para siempre con Reason=PartitionConfig, el portal mostraba "Your session is
+# currently starting..." y la app nunca arrancaba. El maximo sigue limitado, pero
+# ahora sale de la capacidad real de los nodos.
+#
+# El default tambien es generico: se calcula como una fraccion del maximo
+# (interactive_default_ratio), redondeado al step del formulario, con un piso.
+# Asi una parte de la capacidad queda pre-seleccionada sin reservar el nodo
+# entero; el usuario sube cores/memoria desde el formulario si necesita mas.
+interactive_num_cores_max: >-
+  {{ [ groups['compute']
+      | map('extract', hostvars, 'ansible_processor_vcpus')
+      | map('default', 0) | map('int') | max, 1 ] | max }}
+interactive_memory_max_mb: >-
+  {{ [ (groups['compute']
+       | map('extract', hostvars, 'ansible_memtotal_mb')
+       | map('default', 0) | map('int') | max) - slurm_node_memory_reserve_mb, 1024 ] | max }}
+interactive_default_ratio: 0.25
+# Cores: ceil del ratio, minimo 1.
+interactive_num_cores_default: >-
+  {{ [ (interactive_num_cores_max | int * interactive_default_ratio) | round(0, 'ceil') | int, 1 ] | max }}
+# Memoria: floor del ratio alineado al step del form (256 MiB), minimo 1024.
+interactive_memory_default_mb: >-
+  {{ [ (((interactive_memory_max_mb | int * interactive_default_ratio) // 256) * 256) | int, 1024 ] | max }}
 
 # ----- Open OnDemand --------------------------------------------------------
 # Regex de hosts a los que el reverse proxy de OOD puede conectarse. El proxy
@@ -357,9 +420,28 @@ ood_shell_node_prefix: "/opt/ood/node-{{ ood_shell_node_version }}"
 # declararlas; el play se encarga de montar / exportfs -ra.
 # context= solo tiene efecto con SELinux (RedHat). En Ubuntu es un no-op, así
 # que se agrega condicionalmente para no dejar una opción engañosa.
-nfs_common_opts: rw,sync,hard,_netdev
+#
+# nofail + x-systemd.mount-timeout=15: el servidor NFS se alcanza por la IP de
+# Tailscale del master (100.x). En el arranque systemd intenta montar antes de
+# que el túnel esté listo y el montaje se cuelga hasta el timeout por defecto
+# (90 s) y muere ("shared.mount: Mounting timed out. Terminating."). Con
+# nofail el arranque NO se rompe y con mount-timeout=15 falla rápido en vez
+# de colgar el boot. El montaje real lo garantiza hpc-nfs-mount.service, que
+# reintenta hasta que el túnel responde.
+nfs_common_opts: rw,sync,hard,_netdev,nofail,x-systemd.mount-timeout=15
 nfs_shared_opts: "{{ nfs_common_opts }}"
 nfs_home_opts: "{{ nfs_common_opts }}{{ ',context=\"system_u:object_r:user_home_t:s0\"' if ansible_os_family == 'RedHat' else '' }}"
+
+# Reintentos del montaje NFS en hpc-nfs-mount.service (en el arranque).
+nfs_mount_retries: 30
+nfs_mount_retry_delay: 5
+
+# Reanudación automática de los nodos de cómputo tras un reinicio del clúster.
+# Ver templates/slurm_resume_nodes.sh.j2: sin esto, un reinicio inesperado
+# deja a los nodos en DOWN* ("Node unexpectedly rebooted") y todos los jobs
+# quedan en PENDING para siempre.
+slurm_resume_timeout: 600
+slurm_resume_interval: 10
 
 
 # Open OnDemand FQDN & TLS

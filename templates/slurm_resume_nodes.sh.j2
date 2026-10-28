@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# Reanuda los nodos de cómputo después de un reinicio del clúster.
+#
+# POR QUÉ EXISTE:
+# Cuando un nodo se reinicia de forma inesperada (apagón, cuelgue, reboot del
+# hypervisor), slurmctld lo marca como DOWN* con el motivo "Node unexpectedly
+# rebooted" y NO lo vuelve a servicio por su cuenta. Todos los jobs quedan en
+# PENDING con el motivo:
+#
+#   "Nodes required for job are DOWN, DRAINED or reserved for jobs in higher
+#    priority partitions"
+#
+# y las apps interactivas del portal quedan en "Your session is currently
+# starting..." para siempre. La corrección manual es:
+#
+#   scontrol update nodename=<nodo> state=RESUME reason=""
+#
+# Este script la hace solo al arrancar el master. Es lo que dejó el cluster
+# caído el 2026-10-21: los tres nodos se reiniciaron y node02 quedó en DOWN*
+# (con el home NFS sin montar encima) sin que nadie lo reanudara.
+#
+# IMPORTANTE: hay que esperar a que cada nodo se registre en el controlador
+# (lo hace slurmd al arrancar) ANTES de reanudarlo. Si se reanuda antes, el
+# controlador vuelve a marcarlo como DOWN* al detectar el cambio de boot_time
+# del nodo, y el RESUME se pierde.
+set -u
+
+CONF="{{ slurm_conf_path | default('/etc/slurm/slurm.conf') }}"
+TIMEOUT="{{ slurm_resume_timeout }}"
+INTERVAL="{{ slurm_resume_interval }}"
+
+node_state() {
+    scontrol show node "$1" 2>/dev/null \
+        | grep -oE '(^|[[:space:]])(Node)?State=[^[:space:]]+' \
+        | head -1 | cut -d= -f2
+}
+
+# Los nodos se leen de slurm.conf: es la misma lista que usa el template para
+# escribir las líneas NodeName=.
+nodes="$(sed -n 's/^[[:space:]]*NodeName=\([^[:space:]]*\).*/\1/p' "$CONF" | sort -u)"
+
+if [ -z "$nodes" ]; then
+    echo "[slurm-resume-nodes] no hay nodos de cómputo en $CONF"
+    exit 0
+fi
+
+deadline=$(( $(date +%s) + TIMEOUT ))
+
+for n in $nodes; do
+    # 1) Esperar a que el nodo esté registrado en el controlador.
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        st="$(node_state "$n")"
+        if [ -n "$st" ]; then
+            break
+        fi
+        sleep "$INTERVAL"
+    done
+
+    # 2) Reanudar hasta que el nodo quede en servicio. Los estados con
+    #    asterisco (IDLE*, DOWN*, DRAIN*) no cuentan como "en servicio".
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        st="$(node_state "$n")"
+        case "$st" in
+            RUNNING|IDLE|MIXED)
+                break
+                ;;
+        esac
+        scontrol update nodename="$n" state=RESUME reason="" >/dev/null 2>&1 || true
+        sleep "$INTERVAL"
+    done
+
+    echo "[slurm-resume-nodes] $n -> $(node_state "$n")"
+done

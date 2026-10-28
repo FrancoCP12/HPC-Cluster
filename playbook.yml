@@ -675,6 +675,84 @@
         state: started
         timeout: 60
 
+    # ------------------------------------------------------------------
+    # Accounting: cluster, cuentas y asociaciones de los usuarios OOD
+    # ------------------------------------------------------------------
+    # SlurmDBD guarda el nombre del cluster TAL CUAL está escrito en
+    # slurm.conf (case sensitive). Si la tabla `cluster` de la DB tiene
+    # "clusterutn" y slurm.conf dice "clusterUTN", cada INSERT del registro
+    # de job viola la FK y el accounting se pierde en silencio: los jobs se
+    # ejecutan pero sacct no muestra nada.
+    - name: Listar los clusters registrados en SlurmDBD
+      ansible.builtin.command:
+        cmd: sacctmgr -n show cluster format=Cluster
+      register: slurmdbd_clusters
+      changed_when: false
+      failed_when: false
+
+    - name: Registrar el cluster clusterUTN en SlurmDBD
+      command: sacctmgr -i add cluster clusterUTN
+      register: add_cluster_result
+      failed_when:
+        - add_cluster_result.rc != 0
+        - "'already exists' not in add_cluster_result.stdout"
+      changed_when: add_cluster_result.rc == 0
+
+    # Un usuario sin asociacion en SlurmDBD puede correr jobs, pero Slurm los
+    # reporta con Account=(null): el accounting no le puede atribuir el
+    # consumo a nadie. Cada usuario del portal (LDAP) necesita su cuenta y su
+    # asociacion con el cluster.
+    - name: Listar las cuentas existentes en SlurmDBD
+      ansible.builtin.command:
+        cmd: sacctmgr -n show account format=Account
+      register: slurmdbd_accounts
+      changed_when: false
+      failed_when: false
+
+    - name: Crear la cuenta de accounting para {{ item }}
+      ansible.builtin.command:
+        cmd: >-
+          sacctmgr -i add account name={{ item }}
+          cluster={{ slurm_cluster_name }}
+      loop: "{{ slurm_accounting_users }}"
+      when: item not in (slurmdbd_accounts.stdout | split())
+      register: slurmdbd_account_created
+
+    - name: Listar las asociaciones del cluster {{ slurm_cluster_name }}
+      ansible.builtin.command:
+        cmd: >-
+          sacctmgr -n show assoc format=Cluster,Account,User
+          where cluster={{ slurm_cluster_name }}
+      register: slurmdbd_assoc
+      changed_when: false
+      failed_when: false
+
+    - name: Normalizar la lista de asociaciones existentes
+      ansible.builtin.set_fact:
+        slurmdbd_assoc_keys: >-
+          {{ slurmdbd_assoc.stdout.splitlines()
+             | map('trim') | select('!=', '')
+             | map('regex_replace', '\s+', ' ') | list }}
+
+    - name: Asociar {{ item }} con la cuenta {{ item }} en {{ slurm_cluster_name }}
+      ansible.builtin.command:
+        cmd: >-
+          sacctmgr -i add user {{ item }} account={{ item }}
+          cluster={{ slurm_cluster_name }}
+      loop: "{{ slurm_accounting_users }}"
+      when: (slurm_cluster_name ~ ' ' ~ item ~ ' ' ~ item) not in slurmdbd_assoc_keys
+      register: slurmdbd_user_assoc
+
+    - name: Verificar las asociaciones de accounting
+      ansible.builtin.command:
+        cmd: sacctmgr -n show assoc format=Cluster,Account,User,DefaultQos
+      register: slurmdbd_assoc_final
+      changed_when: false
+
+    - name: Mostrar el detalle de las asociaciones
+      ansible.builtin.debug:
+        msg: "{{ slurmdbd_assoc_final.stdout_lines }}"
+
   handlers:
     - name: Reiniciar mysql
       ansible.builtin.systemd:
@@ -1074,8 +1152,10 @@
             group: root
             mode: '0644'
             content: |
-              {{ slurm_shared_dir }} {{ nfs_export_networks }}(rw,sync,no_subtree_check)
-              {{ shared_home_root }} {{ nfs_export_networks }}(rw,sync,no_subtree_check)
+              {% for net in nfs_export_networks %}
+              {{ slurm_shared_dir }} {{ net }}(rw,sync,no_subtree_check)
+              {{ shared_home_root }} {{ net }}(rw,sync,no_subtree_check)
+              {% endfor %}
               {% for c in nfs_home_admin_clients %}
               {{ shared_home_root }} {{ c }}(rw,sync,no_subtree_check,no_root_squash)
               {% endfor %}
@@ -1115,6 +1195,24 @@
           ansible.builtin.apt:
             name: nfs-common
             state: present
+
+        # El servidor NFS es el master y se alcanza por su IP de Tailscale
+        # (100.x). El montaje tiene que ESPERAR a que Tailscale este arriba:
+        # si no, el montaje se cuelga hasta el timeout y /export/home queda
+        # vacio en los nodos de computo (los jobs mueren con signal 53 y las
+        # apps del portal quedan en "starting..." para siempre).
+        - name: Detectar si Tailscale esta disponible en el nodo
+          ansible.builtin.command: systemctl list-unit-files tailscaled.service
+          register: hpc_tailscale_unit
+          changed_when: false
+          failed_when: false
+
+        - name: Calcular la opcion de montaje que depende de Tailscale
+          ansible.builtin.set_fact:
+            nfs_tailscale_opt: >-
+              {{ ',x-systemd.requires=tailscaled.service'
+                 if 'tailscaled.service' in (hpc_tailscale_unit.stdout | default(''))
+                 else '' }}
 
         - name: Crear directorios de montaje
           ansible.builtin.file:
@@ -1156,12 +1254,53 @@
             executable: /bin/bash
           changed_when: false
 
+        - name: Desplegar el script de montaje NFS con reintentos
+          ansible.builtin.template:
+            src: templates/hpc_nfs_mount.sh.j2
+            dest: /usr/local/sbin/hpc_nfs_mount.sh
+            owner: root
+            group: root
+            mode: '0755'
+
+        - name: Crear la unidad systemd que monta el NFS al arrancar
+          # Es la que deja el cluster en pie despues de un reinicio: el
+          # montaje de fstab puede fallar porque el tunel de Tailscale todavia
+          # no estaba listo, y esta unidad reintenta hasta que queda montado.
+          ansible.builtin.copy:
+            dest: /etc/systemd/system/hpc-nfs-mount.service
+            owner: root
+            group: root
+            mode: '0644'
+            content: |
+              [Unit]
+              Description=Montar el almacenamiento compartido del clúster (NFS) con reintentos
+              After=network-online.target{{ ' tailscaled.service' if nfs_tailscale_opt | length > 0 else '' }}
+              Wants=network-online.target
+              {{ 'Requires=tailscaled.service' if nfs_tailscale_opt | length > 0 else '' }}
+
+              [Service]
+              Type=oneshot
+              RemainAfterExit=yes
+              ExecStart=/usr/local/sbin/hpc_nfs_mount.sh
+              TimeoutStartSec=600
+
+              [Install]
+              WantedBy=multi-user.target
+          notify: Reiniciar hpc-nfs-mount
+
+        - name: Habilitar y arrancar hpc-nfs-mount
+          ansible.builtin.systemd:
+            name: hpc-nfs-mount
+            state: started
+            enabled: true
+            daemon_reload: true
+
         - name: Montar y persistir {{ slurm_shared_dir }}
           ansible.posix.mount:
             src: "{{ hostvars[groups['master'][0]]['ansible_host'] | default(groups['master'][0]) }}:{{ slurm_shared_dir }}"
             path: "{{ slurm_shared_dir }}"
             fstype: nfs
-            opts: "{{ nfs_shared_opts }}"
+            opts: "{{ nfs_shared_opts }}{{ nfs_tailscale_opt }}"
             state: mounted
 
         - name: Montar y persistir {{ shared_home_root }}
@@ -1169,8 +1308,32 @@
             src: "{{ hostvars[groups['master'][0]]['ansible_host'] | default(groups['master'][0]) }}:{{ shared_home_root }}"
             path: "{{ shared_home_root }}"
             fstype: nfs
-            opts: "{{ nfs_home_opts }}"
+            opts: "{{ nfs_home_opts }}{{ nfs_tailscale_opt }}"
             state: mounted
+
+        # Si el NFS quedo sin montar (por ejemplo porque Tailscale tardo en
+        # levantar), el home del usuario no existe en el nodo y los jobs
+        # sbatch mueren al instante. Se verifica y se reintenta el montaje.
+        - name: Verificar que el home compartido quedo montado
+          ansible.builtin.command: mountpoint -q {{ shared_home_root }}
+          register: hpc_nfs_mounted
+          changed_when: false
+          failed_when: false
+          retries: 5
+          delay: 5
+          until: hpc_nfs_mounted.rc == 0
+
+        - name: Forzar el montaje del home compartido si quedo sin montar
+          ansible.builtin.command: /usr/local/sbin/hpc_nfs_mount.sh
+          when: hpc_nfs_mounted.rc != 0
+          changed_when: true
+
+  handlers:
+    - name: Reiniciar hpc-nfs-mount
+      ansible.builtin.systemd:
+        name: hpc-nfs-mount
+        state: restarted
+        daemon_reload: true
 
 # ----------------------------------------------------------------------------
 # 5. Nodos de Cómputo (slurmd) y Detección GRES
@@ -1382,13 +1545,24 @@
   hosts: master
   become: true
   tasks:
-    - name: Actualizar slurm.conf definitivo con las GPUs detectadas en todos los workers
+    - name: Actualizar slurm.conf definitivo con CPUs, RAM y GPUs detectadas en todos los workers
       ansible.builtin.template:
         src: templates/slurm.conf.j2
         dest: /etc/slurm/slurm.conf
         owner: "{{ slurm_user }}"
         group: "{{ slurm_group }}"
         mode: '0644'
+      register: slurm_conf_final
+
+    # CPUs y RealMemory NO se pueden cambiar en caliente: 'scontrol reconfigure'
+    # los ignora con "Node configuration change requires slurmctld restart". Hay
+    # que reiniciar slurmctld para que tome los valores detectados por el template.
+    - name: Reiniciar slurmctld para aplicar CPUs/RealMemory detectados
+      ansible.builtin.systemd:
+        name: slurmctld
+        state: restarted
+        daemon_reload: true
+      when: slurm_conf_final.changed
 
     - name: Reconfigurar slurmctld en caliente
       ansible.builtin.command: scontrol reconfigure
@@ -1398,35 +1572,87 @@
       ansible.builtin.pause:
         seconds: 3
 
+    # El NodeName que usa slurm.conf es ansible_hostname (node02), no el alias
+    # del inventario (worker1). Se arma la lista con .get() porque extract()
+    # aborta el play si a un nodo todavia no le vagaron los facts.
+    - name: Calcular los NodeName reales de Slurm de los nodos de computo
+      ansible.builtin.set_fact:
+        slurm_compute_nodes: "{{ slurm_compute_nodes | default([]) + [node_name] }}"
+      loop: "{{ groups['compute'] }}"
+      vars:
+        node_name: "{{ hostvars[item].get('ansible_hostname', '') }}"
+      when: node_name | length > 0
+
     - name: Limpiar posibles estados DRAIN y reanudar nodos
       # OJO: hay que usar el NodeName real de Slurm (ansible_hostname), no el
       # alias del inventario. 'scontrol update nodename=worker1' falla con
-      # "lookup failure for node" porque el nodo se llama workf, no worker1.
+      # "lookup failure for node" porque el nodo se llama node02, no worker1.
       ansible.builtin.shell: 'scontrol update nodename={{ item }} state=RESUME reason=""'
-      loop: "{{ groups['compute'] | map('extract', hostvars, 'inventory_hostname_short') | list }}"
+      loop: "{{ slurm_compute_nodes | default([]) }}"
       changed_when: false
       failed_when: false
 
     - name: Verificar que los nodos de computo quedaron registrados y en servicio
       ansible.builtin.shell: |
         set -uo pipefail
-        rc=0
-        for n in {{ groups['compute'] | map('extract', hostvars, 'ansible_hostname') | join(' ') }}; do
-          state=$(timeout 30 scontrol show node "$n" 2>/dev/null \
-                  | grep -oE '(^|[[:space:]])(Node)?State=[^[:space:]]+' \
-                  | head -1 | cut -d= -f2)
-          printf '  %s -> %s\n' "$n" "${state:-NO REGISTRADO}"
-          case "$state" in
-            RUNNING|IDLE|MIXED) ;;
-            *) rc=1 ;;
-          esac
-        done
-        exit $rc
+        state=$(timeout 30 scontrol show node "{{ item }}" 2>/dev/null \
+                | grep -oE '(^|[[:space:]])(Node)?State=[^[:space:]]+' \
+                | head -1 | cut -d= -f2)
+        printf '  %s -> %s\n' "{{ item }}" "${state:-NO REGISTRADO}"
+        case "$state" in
+          RUNNING|IDLE|MIXED) exit 0 ;;
+          *) exit 1 ;;
+        esac
+      loop: "{{ slurm_compute_nodes | default([]) }}"
       register: slurm_node_registro
       changed_when: false
       retries: 12
       delay: 5
       until: slurm_node_registro.rc == 0
+
+    # --- Auto-reanudacion de nodos tras un reinicio -------------------------
+    # slurmctld NO vuelve a servicio un nodo que se reinicio de forma
+    # inesperada: lo deja en DOWN* con "Node unexpectedly rebooted" y todos
+    # los jobs quedan en PENDING para siempre. slurm-resume-nodes.service
+    # hace esa correccion solo al arrancar el master.
+    - name: Desplegar el script que reanuda los nodos de computo
+      ansible.builtin.template:
+        src: templates/slurm_resume_nodes.sh.j2
+        dest: /usr/local/sbin/slurm_resume_nodes.sh
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Crear la unidad systemd que reanuda los nodos al arrancar
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/slurm-resume-nodes.service
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Reanudar los nodos de cómputo tras un reinicio del clúster
+          After=slurmctld.service network-online.target
+          Wants=slurmctld.service
+
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStart=/usr/local/sbin/slurm_resume_nodes.sh
+          TimeoutStartSec=900
+
+          [Install]
+          # Se engancha a slurmctld y NO a multi-user.target: si un nodo esta
+          # caido de verdad, el script reintenta hasta slurm_resume_timeout y
+          # no tiene que bloquear el arranque del master.
+          WantedBy=slurmctld.service
+
+    - name: Habilitar y arrancar slurm-resume-nodes
+      ansible.builtin.systemd:
+        name: slurm-resume-nodes
+        state: started
+        enabled: true
+        daemon_reload: true
 
 
 # ----------------------------------------------------------------------------

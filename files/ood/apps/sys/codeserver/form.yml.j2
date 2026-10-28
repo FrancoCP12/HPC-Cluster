@@ -10,9 +10,10 @@ form:
 
 attributes:
   bc_num_hours:
-    label: "Duración maxima"
+    label: "Duración máxima (horas)"
     value: "04:00:00"
     widget: "text_field"
+    help: "Un número solo se cuenta como HORAS (2 = 2 horas). También se puede escribir HH:MM:SS (por ejemplo 04:00:00)."
   bc_num_cores:
     label: "Cores"
     value: "{{ interactive_num_cores_default }}"

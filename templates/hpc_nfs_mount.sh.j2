@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# Monta el almacenamiento compartido del clúster (NFS) con reintentos.
+#
+# POR QUÉ EXISTE:
+# El servidor NFS es el master, y se alcanza por su IP de Tailscale (100.x). En
+# el arranque, systemd intenta montar {{ slurm_shared_dir }} y {{ shared_home_root }}
+# antes de que el túnel de Tailscale esté listo: el montaje se queda colgado
+# hasta el timeout y muere con "Mounting timed out. Terminating.". El
+# resultado es que {{ shared_home_root }} queda VACÍO en los nodos de cómputo y en el
+# nodo de Open OnDemand.
+#
+# Con el home vacío pasa esto:
+#   - slurmstepd: "couldn't chdir to <home>: No such file or directory"
+#   - el job muere al instante con RaisedSignal:53 (sbatch "envia" el job pero
+#     nunca ejecuta nada)
+#   - el portal queda en "Your session is currently starting..." para siempre.
+#
+# Este script reintenta el montaje hasta que queda firme. Lo invoca
+# hpc-nfs-mount.service al arrancar (After=tailscaled.service), que es lo que
+# deja el cluster en pie después de un reinicio.
+set -u
+
+RETRIES="{{ nfs_mount_retries }}"
+DELAY="{{ nfs_mount_retry_delay }}"
+MOUNTS=("{{ slurm_shared_dir }}" "{{ shared_home_root }}")
+
+mount_one() {
+    local path="$1"
+    local unit=""
+    local i=0
+
+    # Nombre de la unidad .mount que systemd genera para ese punto de montaje
+    # (ej: /export/home -> export-home.mount). Sirve para resetear el estado
+    # "failed" de un intento anterior y poder reintentar.
+    unit="$(systemd-escape --path --suffix=mount "$path" 2>/dev/null || true)"
+
+    while [ "$i" -lt "$RETRIES" ]; do
+        if mountpoint -q "$path"; then
+            echo "[hpc-nfs-mount] $path ya está montado"
+            return 0
+        fi
+
+        if mount "$path" 2>/dev/null; then
+            echo "[hpc-nfs-mount] $path montado"
+            return 0
+        fi
+
+        i=$((i + 1))
+        echo "[hpc-nfs-mount] no se pudo montar $path (intento $i/$RETRIES); reintento en ${DELAY}s"
+
+        # Si la unidad .mount quedó en failed, hay que resetearla antes de
+        # volver a intentarlo.
+        if [ -n "$unit" ]; then
+            systemctl reset-failed "$unit" 2>/dev/null || true
+        fi
+
+        sleep "$DELAY"
+    done
+
+    echo "[hpc-nfs-mount] ERROR: no se pudo montar $path" >&2
+    return 1
+}
+
+rc=0
+for m in "${MOUNTS[@]}"; do
+    mount_one "$m" || rc=1
+done
+
+exit $rc
